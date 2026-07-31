@@ -1,0 +1,34 @@
+[package]
+name = "iroh-drop-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Desktop app for iroh-drop: send files to people, and keep serving what you got"
+
+[lib]
+name = "iroh_drop_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iroh-drop-app"
+path = "src/main.rs"
+
+[dependencies]
+iroh-drop-daemon = { path = "../iroh-drop-daemon" }
+eframe = { version = "0.29", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.29"
+rfd = "0.15"
+qrcode = { version = "0.14", default-features = false }
+tokio = { workspace = true }
+serde_json = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

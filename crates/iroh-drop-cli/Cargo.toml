@@ -1,0 +1,26 @@
+[package]
+name = "iroh-drop-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "CLI for the iroh-drop protocol"
+
+[[bin]]
+name = "iroh-drop"
+path = "src/main.rs"
+
+[dependencies]
+iroh-drop = { path = "../iroh-drop" }
+iroh-drop-sdk = { workspace = true }
+iroh-drop-daemon = { path = "../iroh-drop-daemon" }
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-gossip = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+qrcode = { version = "0.14", default-features = false }

@@ -1,0 +1,26 @@
+[package]
+name = "iroh-drop-sdk"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Human-friendly conventions on top of the iroh-drop protocol: collections, config, inventory picking"
+
+[features]
+default = ["mdns"]
+mdns = ["dep:iroh-mdns-address-lookup", "iroh-drop/mdns"]
+
+[dependencies]
+iroh-drop = { path = "../iroh-drop" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+toml = "0.8"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio-stream = "0.1"
+iroh = "1.0.3"
+iroh-mdns-address-lookup = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

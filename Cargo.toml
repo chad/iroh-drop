@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/iroh-drop",
+    "crates/iroh-drop-sdk",
+    "crates/iroh-drop-daemon",
+    "crates/iroh-drop-cli",
+    "crates/iroh-drop-gui",
+]
+
+[workspace.dependencies]
+iroh = "1.0.3"
+iroh-blobs = "0.103.0"
+iroh-gossip = "0.101.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+postcard = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+iroh-drop-sdk = { path = "crates/iroh-drop-sdk" }

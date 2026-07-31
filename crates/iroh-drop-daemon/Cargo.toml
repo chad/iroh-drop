@@ -1,0 +1,29 @@
+[package]
+name = "iroh-drop-daemon"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Long-lived host for iroh-drop sessions, plus the JSONL control API every client speaks"
+
+[features]
+default = ["mdns"]
+mdns = ["iroh-drop-sdk/mdns", "iroh-drop/mdns"]
+
+[dependencies]
+iroh = { workspace = true }
+iroh-drop = { path = "../iroh-drop" }
+iroh-drop-sdk = { path = "../iroh-drop-sdk" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "iroh-dropd"
+path = "src/bin/iroh-dropd.rs"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
