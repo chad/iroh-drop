@@ -364,6 +364,14 @@ async fn start_helper(socket: &Option<PathBuf>, lan_only: bool) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Spawning a console binary from a windowed app would otherwise pop a
+    // console window next to it. The helper stays a console exe so it is
+    // usable standalone; only the GUI's spawn hides the window.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     if lan_only {
         command.arg("--lan-only");
     }

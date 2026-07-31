@@ -6,6 +6,8 @@
 //! the only decision they make is yes or no.
 
 #![deny(missing_docs)]
+// No console window for the shipped app; debug builds keep one for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use iroh_drop_gui::{bridge, qr};
 
