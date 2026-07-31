@@ -62,8 +62,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>              <string>iroh-drop</string>
-  <key>CFBundleDisplayName</key>       <string>iroh-drop</string>
+  <key>CFBundleName</key>              <string>Drop</string>
+  <key>CFBundleDisplayName</key>       <string>Drop</string>
   <key>CFBundleIdentifier</key>        <string>computer.iroh.drop</string>
   <key>CFBundleExecutable</key>        <string>iroh-drop-app</string>
   <key>CFBundleIconFile</key>          <string>AppIcon</string>

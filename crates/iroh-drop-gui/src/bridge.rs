@@ -50,11 +50,33 @@ pub enum Cmd {
         /// Display name, for the log line.
         name: String,
     },
+    /// Retry a failed transfer. The pick is the offer's name, which
+    /// resolve_pick accepts as well as listing numbers.
+    Retry {
+        /// The drop the offer lives in.
+        drop: String,
+        /// Display name, doubling as the pick.
+        name: String,
+    },
+    /// Forget every transfer that has finished, successfully or not.
+    ClearFinished,
+    /// Dismiss the current error banner.
+    DismissError,
+    /// A fresh link for a drop that already exists, so it can be handed out
+    /// again without re-picking the files.
+    Ticket {
+        /// The drop's handle.
+        handle: String,
+        /// Display name, for the share block's heading.
+        name: String,
+    },
 }
 
 /// One thing being sent or received.
 #[derive(Clone, Debug)]
 pub struct Transfer {
+    /// The drop the bytes are coming from, so a failure can offer Try Again.
+    pub drop: String,
     /// Display name, from untrusted offer metadata.
     pub name: String,
     /// Bytes transferred so far.
@@ -84,6 +106,8 @@ impl Transfer {
 pub struct Incoming {
     /// Correlation id to answer with.
     pub id: u64,
+    /// The drop the offer arrived in, so the card can say which group.
+    pub drop: String,
     /// Offered name. Untrusted; always render it quoted.
     pub name: String,
     /// Human-readable size.
@@ -140,6 +164,8 @@ pub struct UiState {
     pub download_dir: String,
     /// The ticket for the most recent send, ready to hand out.
     pub share_link: Option<String>,
+    /// Whose link it is, for the share block's heading.
+    pub share_link_name: Option<String>,
     /// A short label while something is in flight.
     pub busy: Option<String>,
     /// The last thing that went wrong, in plain language.
@@ -276,6 +302,9 @@ async fn run(
     let mut asks = client.asks();
     // hash → display name, so progress events can be labelled.
     let mut names: HashMap<String, String> = HashMap::new();
+    // hash → drop handle, so fetch.materialized — which carries no drop —
+    // still lets a failed transfer offer Try Again.
+    let mut drops_of: HashMap<String, String> = HashMap::new();
     // Drops the user explicitly asked to receive, and when.
     let mut requested: HashMap<String, Instant> = HashMap::new();
 
@@ -326,6 +355,7 @@ async fn run(
                         let mut state = state.lock().expect("state");
                         state.incoming.push(Incoming {
                             id: ask.id,
+                            drop: handle.clone(),
                             // Untrusted display metadata: shown quoted, never
                             // interpreted as a path.
                             name: str_of(&ask.p, "name"),
@@ -341,7 +371,15 @@ async fn run(
             event = events.recv() => {
                 match event {
                     Ok(env) => {
-                        apply_event(&state, &mut names, &env);
+                        let membership_changed = matches!(
+                            env.e.as_str(),
+                            "peer.joined" | "peer.left" | "drop.joined" | "drop.left"
+                                | "offer.received" | "offer.declined"
+                        );
+                        apply_event(&state, &mut names, &mut drops_of, &env);
+                        if membership_changed {
+                            refresh_status(&client, &state).await;
+                        }
                         ctx.request_repaint();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -471,11 +509,13 @@ async fn handle_cmd(
             }
         }
         Cmd::Send(paths) => {
+            let label = send_label(&paths);
             {
                 let mut state = state.lock().expect("state");
                 state.busy = Some("Preparing…".into());
                 state.error = None;
                 state.share_link = None;
+                state.share_link_name = None;
             }
             ctx.request_repaint();
             let result = do_send(client, &paths).await;
@@ -485,6 +525,7 @@ async fn handle_cmd(
                 Ok(link) => {
                     state.note(format!("Ready to share {} item(s).", paths.len()));
                     state.share_link = Some(link);
+                    state.share_link_name = Some(label);
                 }
                 Err(e) => state.error = Some(e),
             }
@@ -521,6 +562,43 @@ async fn handle_cmd(
                 state.lock().expect("state").error = Some(e.msg);
             }
         }
+        Cmd::Retry { drop, name } => {
+            {
+                let mut state = state.lock().expect("state");
+                for transfer in &mut state.transfers {
+                    if transfer.drop == drop && transfer.name == name && transfer.failed.is_some() {
+                        transfer.finished = false;
+                        transfer.failed = None;
+                        transfer.done = 0;
+                    }
+                }
+            }
+            if let Err(e) = client
+                .call("offer.fetch", json!({"drop": drop, "pick": name}))
+                .await
+            {
+                state.lock().expect("state").error = Some(e.msg);
+            }
+        }
+        Cmd::DismissError => {
+            state.lock().expect("state").error = None;
+        }
+        Cmd::ClearFinished => {
+            state
+                .lock()
+                .expect("state")
+                .transfers
+                .retain(|transfer| !transfer.finished);
+        }
+        Cmd::Ticket { handle, name } => match client.call("drop.ticket", json!({"drop": handle})).await {
+            Ok(ticket) => {
+                let mut state = state.lock().expect("state");
+                state.share_link = Some(str_of(&ticket, "link"));
+                state.share_link_name = Some(name);
+                state.error = None;
+            }
+            Err(e) => state.lock().expect("state").error = Some(e.msg),
+        },
     }
     refresh_status(client, state).await;
     ctx.request_repaint();
@@ -571,23 +649,22 @@ async fn do_receive(client: &Arc<Client>, input: &str) -> Result<String, String>
         .map_err(|e| e.msg)?;
     let handle = str_of(&joined, "drop");
 
-    // Wait only so we can say "there is nothing there" instead of nothing at
-    // all. Contents arrive by catch-up sync or a live announcement.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    // Membership is sticky: an empty group is not an error, it is a group
+    // whose files have not been offered yet. Wait only long enough for a
+    // healthy catch-up to surface what already exists, then hand the group
+    // to the UI either way. Anything offered later arrives by itself.
+    let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         let listed = client
             .call("offer.list", json!({"drop": handle}))
             .await
             .map_err(|e| e.msg)?;
-        if !listed["items"]
+        let empty = listed["items"]
             .as_array()
             .map(|items| items.is_empty())
-            .unwrap_or(true)
-        {
+            .unwrap_or(true);
+        if !empty || Instant::now() > deadline {
             return Ok(handle);
-        }
-        if Instant::now() > deadline {
-            return Err("nobody offered anything in that drop".into());
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
@@ -658,9 +735,18 @@ async fn refresh_status(client: &Arc<Client>, state: &Arc<Mutex<UiState>>) {
     state.lock().expect("state").available = available;
 }
 
-fn apply_event(state: &Arc<Mutex<UiState>>, names: &mut HashMap<String, String>, env: &Envelope) {
+fn apply_event(
+    state: &Arc<Mutex<UiState>>,
+    names: &mut HashMap<String, String>,
+    drops_of: &mut HashMap<String, String>,
+    env: &Envelope,
+) {
     let mut state = state.lock().expect("state");
     let hash = str_of(&env.p, "hash");
+    let drop = str_of(&env.p, "drop");
+    if !hash.is_empty() && !drop.is_empty() {
+        drops_of.insert(hash.clone(), drop);
+    }
     match env.e.as_str() {
         "offer.received" => {
             names.insert(hash, str_of(&env.p, "name"));
@@ -675,6 +761,7 @@ fn apply_event(state: &Arc<Mutex<UiState>>, names: &mut HashMap<String, String>,
                     existing.total = total;
                 }
                 None => state.transfers.push(Transfer {
+                    drop: drops_of.get(&hash).cloned().unwrap_or_default(),
                     name,
                     done,
                     total,
@@ -699,6 +786,7 @@ fn apply_event(state: &Arc<Mutex<UiState>>, names: &mut HashMap<String, String>,
                     existing.saved_to = paths;
                 }
                 None => state.transfers.push(Transfer {
+                    drop: drops_of.get(&hash).cloned().unwrap_or_default(),
                     name,
                     done: 0,
                     total: None,

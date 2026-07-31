@@ -29,10 +29,21 @@ struct ContentView: View {
                     ForEach(model.incoming) { IncomingCard(item: $0) }
 
                     if let error = model.errorMessage {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.orange)
-                            .textSelection(.enabled)
+                        HStack(spacing: 8) {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .font(.callout)
+                                .foregroundStyle(.orange)
+                                .textSelection(.enabled)
+                            Spacer(minLength: 4)
+                            Button {
+                                model.errorMessage = nil
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Dismiss")
+                        }
                     }
 
                     DropZone()
@@ -142,8 +153,9 @@ private struct DropZone: View {
                             .font(.caption)
                             .foregroundStyle(.tertiary)
                     }
-                    Button("Choose Files…") { chooseFiles() }
+                    Button("Choose Files…") { model.chooseFiles() }
                         .controlSize(.regular)
+                        .keyboardShortcut("o", modifiers: .command)
                 }
             }
             .padding(.vertical, 30)
@@ -154,16 +166,6 @@ private struct DropZone: View {
             load(providers: providers)
             return true
         }
-    }
-
-    private func chooseFiles() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = true
-        panel.prompt = "Send"
-        panel.message = "Choose files or a folder to send."
-        if panel.runModal() == .OK { model.send(urls: panel.urls) }
     }
 
     private func load(providers: [NSItemProvider]) {
@@ -256,7 +258,10 @@ private struct IncomingCard: View {
                     .font(.body.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                Text([item.size, "from \(item.sender)", "expires in \(remaining)"]
+                Text([item.size,
+                      "from \(item.sender)",
+                      model.groupName(for: item.drop).map { "in \($0)" } ?? "",
+                      "expires in \(remaining)"]
                         .filter { !$0.isEmpty }
                         .joined(separator: " · "))
                     .font(.caption)
@@ -298,26 +303,46 @@ private struct AvailableSection: View {
             Card {
                 ForEach(Array(model.available.enumerated()), id: \.element.id) { index, offer in
                     if index > 0 { Divider().padding(.leading, 38) }
-                    HStack(spacing: 10) {
-                        Image(systemName: "tray.and.arrow.down.fill")
-                            .foregroundStyle(.secondary)
-                            .font(.title3)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(offer.name).lineLimit(1).truncationMode(.middle)
-                            Text([offer.size, "in \(offer.groupName)"]
-                                .filter { !$0.isEmpty }
-                                .joined(separator: " · "))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 6)
-                        Button("Get") { model.fetch(offer) }
-                            .controlSize(.small)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
+                    AvailableRowView(offer: offer)
                 }
             }
+        }
+    }
+}
+
+private struct AvailableRowView: View {
+    @EnvironmentObject private var model: AppModel
+    let offer: AvailableOffer
+    /// Tapped, waiting for the transfer to show up in Received. The row
+    /// leaves when the offer's status flips; until then a second tap must
+    /// not ask twice.
+    @State private var getting = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "tray.and.arrow.down.fill")
+                .foregroundStyle(.secondary)
+                .font(.title3)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(offer.name).lineLimit(1).truncationMode(.middle)
+                Text([offer.size, "in \(offer.groupName)"]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 6)
+            Button(getting ? "Getting…" : "Get") {
+                getting = true
+                model.fetch(offer)
+            }
+            .controlSize(.small)
+            .disabled(getting)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .contextMenu {
+            Button("Get") { model.fetch(offer) }
         }
     }
 }
@@ -349,6 +374,14 @@ private struct SharingSection: View {
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
+                    .contextMenu {
+                        Button("Copy Link") { model.copyLink(for: drop) }
+                        Button("Show Link & QR…") { model.showLink(for: drop) }
+                        Divider()
+                        Button(drop.mine ? "Stop Sharing" : "Leave Group", role: .destructive) {
+                            model.stopSharing(drop)
+                        }
+                    }
                 }
             }
         }
@@ -369,7 +402,16 @@ private struct ReceivedSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
-            SectionHeader(title: "Received")
+            HStack {
+                SectionHeader(title: "Received")
+                Spacer()
+                if model.transfers.contains(where: \.finished) {
+                    Button("Clear") { model.clearFinished() }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             Card {
                 ForEach(Array(model.transfers.reversed().prefix(10).enumerated()),
                         id: \.element.id) { index, transfer in
@@ -396,7 +438,15 @@ private struct TransferRow: View {
                     Text(failure).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 } else if !transfer.finished {
                     if let fraction = transfer.fraction {
-                        ProgressView(value: fraction).controlSize(.small)
+                        HStack(spacing: 6) {
+                            ProgressView(value: fraction).controlSize(.small)
+                            if let label = transfer.progressLabel {
+                                Text(label)
+                                    .font(.caption2)
+                                    .foregroundStyle(.tertiary)
+                                    .monospacedDigit()
+                            }
+                        }
                     } else {
                         Text("receiving…").font(.caption).foregroundStyle(.secondary)
                     }
@@ -405,6 +455,10 @@ private struct TransferRow: View {
                 }
             }
             Spacer(minLength: 6)
+            if transfer.failure != nil, !transfer.drop.isEmpty {
+                Button("Try Again") { model.retry(transfer) }
+                    .controlSize(.small)
+            }
             if transfer.finished, transfer.failure == nil, let path = transfer.savedTo.first {
                 Button("Show") { model.reveal(path: path) }
                     .controlSize(.small)
@@ -412,6 +466,14 @@ private struct TransferRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
+        .contextMenu {
+            if transfer.finished, transfer.failure == nil, let path = transfer.savedTo.first {
+                Button("Show in Finder") { model.reveal(path: path) }
+            }
+            if transfer.failure != nil, !transfer.drop.isEmpty {
+                Button("Try Again") { model.retry(transfer) }
+            }
+        }
     }
 
     @ViewBuilder private var icon: some View {

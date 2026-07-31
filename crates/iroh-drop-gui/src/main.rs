@@ -11,7 +11,9 @@
 
 use iroh_drop_gui::{bridge, qr};
 
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use bridge::{Bridge, Cmd, UiState};
 use eframe::egui;
@@ -40,7 +42,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([560.0, 680.0])
             .with_min_inner_size([460.0, 480.0])
-            .with_title("iroh-drop"),
+            .with_title("Drop — iroh-drop"),
         ..Default::default()
     };
 
@@ -58,6 +60,11 @@ struct App {
     bridge: Bridge,
     link_input: String,
     qr_open: bool,
+    /// When the copy button was last pressed, so its label can say so.
+    copied_at: Option<Instant>,
+    /// Gets already asked for ("drop/pick"), so the button cannot ask twice
+    /// while the transfer is still spinning up.
+    getting: HashSet<String>,
 }
 
 impl App {
@@ -66,7 +73,14 @@ impl App {
             bridge,
             link_input: String::new(),
             qr_open: false,
+            copied_at: None,
+            getting: HashSet::new(),
         }
+    }
+
+    fn recently_copied(&self) -> bool {
+        self.copied_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2))
     }
 }
 
@@ -88,6 +102,20 @@ impl eframe::App for App {
         });
         if !dropped.is_empty() {
             self.bridge.send(Cmd::Send(dropped));
+        }
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+
+        // A Get whose row has left the list (the transfer started) may go.
+        self.getting.retain(|key| {
+            snapshot
+                .available
+                .iter()
+                .any(|row| format!("{}/{}", row.drop, row.pick) == *key)
+        });
+
+        // The copy label flips back after two seconds; make sure we repaint.
+        if self.recently_copied() {
+            ctx.request_repaint_after(Duration::from_millis(300));
         }
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
@@ -112,216 +140,398 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(error) = &snapshot.error {
-                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), error);
-                ui.add_space(6.0);
-            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if let Some(error) = &snapshot.error {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(200, 120, 40),
+                                format!("\u{26a0} {error}"),
+                            );
+                            if ui.small_button("\u{2715}").clicked() {
+                                self.bridge.send(Cmd::DismissError);
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
 
-            // ── consent, first, because it is the only thing that blocks ──
-            for incoming in &snapshot.incoming {
-                egui::Frame::group(ui.style())
-                    .fill(ui.visuals().extreme_bg_color)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Someone wants to send you:").strong());
-                        // Quoted: a filename must never be able to look like
-                        // our own text.
-                        ui.label(format!("{:?}   {}", incoming.name, incoming.size));
-                        let remaining = incoming
-                            .expires_at
-                            .saturating_duration_since(std::time::Instant::now())
-                            .as_secs();
+                    // ── consent, first, because it is the only thing that blocks ──
+                    for incoming in &snapshot.incoming {
+                        egui::Frame::group(ui.style())
+                            .fill(ui.visuals().extreme_bg_color)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(egui::RichText::new("Someone wants to send you:").strong());
+                                // Quoted: a filename must never be able to look
+                                // like our own text.
+                                ui.label(format!("{:?}   {}", incoming.name, incoming.size));
+                                let remaining = incoming
+                                    .expires_at
+                                    .saturating_duration_since(Instant::now())
+                                    .as_secs();
+                                let group = snapshot
+                                    .drops
+                                    .iter()
+                                    .find(|d| d.handle == incoming.drop)
+                                    .map(|d| d.name.as_str())
+                                    .unwrap_or("");
+                                let context = if group.is_empty() {
+                                    format!("from {}", incoming.from)
+                                } else {
+                                    format!("from {}  \u{2022}  in {group}", incoming.from)
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{context}  \u{2022}  expires in {}:{:02}",
+                                        remaining / 60,
+                                        remaining % 60
+                                    ))
+                                    .small()
+                                    .weak(),
+                                );
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Accept").clicked() {
+                                        self.bridge.send(Cmd::Answer {
+                                            id: incoming.id,
+                                            accept: true,
+                                        });
+                                    }
+                                    if ui.button("No thanks").clicked() {
+                                        self.bridge.send(Cmd::Answer {
+                                            id: incoming.id,
+                                            accept: false,
+                                        });
+                                    }
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
+
+                    // ── send ──────────────────────────────────────────────
+                    let send_fill = if hovering {
+                        ui.visuals().selection.bg_fill.gamma_multiply(0.25)
+                    } else {
+                        ui.visuals().faint_bg_color
+                    };
+                    egui::Frame::group(ui.style())
+                        .fill(send_fill)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new("Send").strong());
+                            ui.label(
+                                egui::RichText::new(if hovering {
+                                    "Release to send"
+                                } else {
+                                    "Drag files onto this window, or:"
+                                })
+                                .small()
+                                .weak(),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui.button("Choose files…").clicked() {
+                                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                                        self.bridge.send(Cmd::Send(paths));
+                                    }
+                                }
+                                if ui.button("Choose a folder…").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.bridge.send(Cmd::Send(vec![path]));
+                                    }
+                                }
+                            });
+
+                            if let Some(busy) = &snapshot.busy {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(busy);
+                                });
+                            }
+
+                            if let Some(link) = &snapshot.share_link {
+                                ui.add_space(6.0);
+                                let heading = match &snapshot.share_link_name {
+                                    Some(name) => format!("Ready to send \u{2014} {name:?}"),
+                                    None => "Ready to send".to_string(),
+                                };
+                                ui.label(egui::RichText::new(heading).strong());
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Hand over this link; anyone with it can get the files.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                let mut shown = link.clone();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut shown)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .button(if self.recently_copied() {
+                                            "Copied \u{2713}"
+                                        } else {
+                                            "Copy link"
+                                        })
+                                        .clicked()
+                                    {
+                                        ctx.copy_text(link.clone());
+                                        self.copied_at = Some(Instant::now());
+                                    }
+                                    if ui
+                                        .button(if self.qr_open { "Hide code" } else { "Show code" })
+                                        .clicked()
+                                    {
+                                        self.qr_open = !self.qr_open;
+                                    }
+                                });
+                                if self.qr_open {
+                                    ui.add_space(4.0);
+                                    qr::show(ui, link);
+                                    ui.label(
+                                        egui::RichText::new("Point a phone camera at this.")
+                                            .small()
+                                            .weak(),
+                                    );
+                                }
+                            }
+                        });
+
+                    ui.add_space(10.0);
+
+                    // ── receive ───────────────────────────────────────────
+                    egui::Frame::group(ui.style())
+                        .fill(ui.visuals().faint_bg_color)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new("Receive").strong());
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.link_input)
+                                        .hint_text("paste a link someone sent you")
+                                        .desired_width(ui.available_width() - 80.0),
+                                );
+                                let ready = bridge::extract_ticket(&self.link_input).is_some();
+                                if ui
+                                    .add_enabled(ready, egui::Button::new("Get files"))
+                                    .clicked()
+                                {
+                                    self.bridge.send(Cmd::Receive(self.link_input.clone()));
+                                    self.link_input.clear();
+                                }
+                            });
+                        });
+
+                    // ── transfers ─────────────────────────────────────────
+                    if !snapshot.transfers.is_empty() {
+                        ui.add_space(14.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Files").strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let any_finished =
+                                        snapshot.transfers.iter().any(|t| t.finished);
+                                    if any_finished && ui.small_button("Clear").clicked() {
+                                        self.bridge.send(Cmd::ClearFinished);
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                        for transfer in snapshot.transfers.iter().rev().take(8) {
+                            ui.horizontal(|ui| {
+                                if let Some(error) = &transfer.failed {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(200, 80, 80),
+                                        format!("\u{26a0} {:?}", transfer.name),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(shorten(error, 40)).small().weak(),
+                                    );
+                                    if !transfer.drop.is_empty()
+                                        && ui.small_button("Try again").clicked()
+                                    {
+                                        self.bridge.send(Cmd::Retry {
+                                            drop: transfer.drop.clone(),
+                                            name: transfer.name.clone(),
+                                        });
+                                    }
+                                } else if transfer.finished {
+                                    ui.label(format!("\u{2713} {:?}", transfer.name));
+                                    if let Some(first) = transfer.saved_to.first() {
+                                        if ui.small_button("Show").clicked() {
+                                            open_folder(parent_of(first));
+                                        }
+                                    }
+                                } else {
+                                    ui.label(format!("{:?}", transfer.name));
+                                    match transfer.fraction() {
+                                        Some(fraction) => {
+                                            ui.add(
+                                                egui::ProgressBar::new(fraction)
+                                                    .desired_width(140.0),
+                                            );
+                                            if let Some(label) = progress_label(transfer) {
+                                                ui.label(egui::RichText::new(label).small().weak());
+                                            }
+                                        }
+                                        None => {
+                                            ui.spinner();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    // ── new in your groups: offered, not yet fetched ──────
+                    if !snapshot.available.is_empty() {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("New in your groups").strong());
                         ui.label(
-                            egui::RichText::new(format!(
-                                "from {}  \u{2022}  expires in {}:{:02}",
-                                incoming.from,
-                                remaining / 60,
-                                remaining % 60
-                            ))
+                            egui::RichText::new(
+                                "Offered while you were away, or a question that timed out. It \
+                                 stays here, ready, until you get it or leave the group.",
+                            )
                             .small()
                             .weak(),
                         );
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Accept").clicked() {
-                                self.bridge.send(Cmd::Answer {
-                                    id: incoming.id,
-                                    accept: true,
-                                });
-                            }
-                            if ui.button("No thanks").clicked() {
-                                self.bridge.send(Cmd::Answer {
-                                    id: incoming.id,
-                                    accept: false,
-                                });
-                            }
-                        });
-                    });
-                ui.add_space(8.0);
-            }
-
-            // ── send ──────────────────────────────────────────────────────
-            ui.heading("Send");
-            ui.label("Drag files here, or:");
-            ui.horizontal(|ui| {
-                if ui.button("Choose files…").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new().pick_files() {
-                        self.bridge.send(Cmd::Send(paths));
-                    }
-                }
-                if ui.button("Choose a folder…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                        self.bridge.send(Cmd::Send(vec![path]));
-                    }
-                }
-            });
-
-            if let Some(busy) = &snapshot.busy {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(busy);
-                });
-            }
-
-            if let Some(link) = &snapshot.share_link {
-                ui.add_space(6.0);
-                ui.label("Send this link to whoever should get the files:");
-                let mut shown = link.clone();
-                ui.add(
-                    egui::TextEdit::multiline(&mut shown)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Copy link").clicked() {
-                        ctx.copy_text(link.clone());
-                    }
-                    if ui.button(if self.qr_open { "Hide code" } else { "Show code" }).clicked() {
-                        self.qr_open = !self.qr_open;
-                    }
-                });
-                if self.qr_open {
-                    ui.add_space(4.0);
-                    qr::show(ui, link);
-                    ui.label(
-                        egui::RichText::new("Point a phone camera at this.")
-                            .small()
-                            .weak(),
-                    );
-                }
-            }
-
-            ui.add_space(14.0);
-
-            // ── receive ───────────────────────────────────────────────────
-            ui.heading("Receive");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.link_input)
-                        .hint_text("paste a link")
-                        .desired_width(ui.available_width() - 90.0),
-                );
-                let ready = bridge::extract_ticket(&self.link_input).is_some();
-                if ui
-                    .add_enabled(ready, egui::Button::new("Get files"))
-                    .clicked()
-                {
-                    self.bridge.send(Cmd::Receive(self.link_input.clone()));
-                    self.link_input.clear();
-                }
-            });
-
-            // ── transfers ─────────────────────────────────────────────────
-            if !snapshot.transfers.is_empty() {
-                ui.add_space(12.0);
-                ui.heading("Files");
-                for transfer in snapshot.transfers.iter().rev().take(8) {
-                    ui.horizontal(|ui| {
-                        if let Some(error) = &transfer.failed {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(200, 80, 80),
-                                format!("{:?} failed: {error}", transfer.name),
-                            );
-                        } else if transfer.finished {
-                            ui.label(format!("\u{2713} {:?}", transfer.name));
-                            if let Some(first) = transfer.saved_to.first() {
-                                if ui.small_button("Show").clicked() {
-                                    open_folder(parent_of(first));
+                        ui.separator();
+                        for row in &snapshot.available {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{:?}  \u{2014} {} in {}",
+                                    row.name, row.size, row.group
+                                ));
+                                let key = format!("{}/{}", row.drop, row.pick);
+                                let pending = self.getting.contains(&key);
+                                if ui
+                                    .add_enabled(
+                                        !pending,
+                                        egui::Button::new(if pending { "Getting…" } else { "Get" })
+                                            .small(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.getting.insert(key);
+                                    self.bridge.send(Cmd::Fetch {
+                                        drop: row.drop.clone(),
+                                        pick: row.pick.clone(),
+                                        name: row.name.clone(),
+                                    });
                                 }
-                            }
-                        } else {
-                            ui.label(format!("{:?}", transfer.name));
-                            match transfer.fraction() {
-                                Some(fraction) => {
-                                    ui.add(egui::ProgressBar::new(fraction).desired_width(160.0));
-                                }
-                                None => {
-                                    ui.spinner();
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-
-            // ── new in your groups: offered, not yet fetched ─────────────
-            if !snapshot.available.is_empty() {
-                ui.add_space(12.0);
-                ui.heading("New in your groups");
-                ui.label(
-                    egui::RichText::new(
-                        "You are in these groups until you leave them; anything offered stays                          here, ready to fetch.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                for row in &snapshot.available {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{:?}  \u{2014} {} in {}",
-                            row.name, row.size, row.group
-                        ));
-                        if ui.small_button("Get").clicked() {
-                            self.bridge.send(Cmd::Fetch {
-                                drop: row.drop.clone(),
-                                pick: row.pick.clone(),
-                                name: row.name.clone(),
                             });
                         }
-                    });
-                }
-            }
+                    }
 
-            // ── what you are still sharing ────────────────────────────────
-            if !snapshot.drops.is_empty() {
-                ui.add_space(12.0);
-                ui.heading("Still sharing");
-                ui.label(
-                    egui::RichText::new(
-                        "These stay available to people who have the link, even after you close \
-                         this window \u{2014} as long as the background helper is running.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                for row in &snapshot.drops {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{}  \u{2014} {} file(s), {} connected",
-                            row.name, row.files, row.peers
-                        ));
-                        if ui
-                            .small_button(if row.mine { "Stop" } else { "Leave" })
-                            .clicked()
-                        {
-                            self.bridge.send(Cmd::Forget(row.handle.clone()));
+                    // ── your groups ───────────────────────────────────────
+                    if !snapshot.drops.is_empty() {
+                        ui.add_space(14.0);
+                        ui.label(egui::RichText::new("Your groups").strong());
+                        ui.label(
+                            egui::RichText::new(
+                                "You stay in these until you leave. Everything in them keeps \
+                                 being served from this machine while the helper runs.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.separator();
+                        for row in &snapshot.drops {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "{}  \u{2014} {} file(s), {}",
+                                    row.name,
+                                    row.files,
+                                    if row.peers == 0 {
+                                        "waiting".to_string()
+                                    } else {
+                                        format!("{} connected", row.peers)
+                                    }
+                                ));
+                                if ui.small_button("Link").clicked() {
+                                    self.bridge.send(Cmd::Ticket {
+                                        handle: row.handle.clone(),
+                                        name: row.name.clone(),
+                                    });
+                                }
+                                if ui
+                                    .small_button(if row.mine { "Stop" } else { "Leave" })
+                                    .clicked()
+                                {
+                                    self.bridge.send(Cmd::Forget(row.handle.clone()));
+                                }
+                            });
                         }
-                    });
-                }
-            }
+                    }
+
+                    // ── nothing at all yet ────────────────────────────────
+                    if snapshot.drops.is_empty()
+                        && snapshot.transfers.is_empty()
+                        && snapshot.available.is_empty()
+                        && snapshot.incoming.is_empty()
+                        && snapshot.share_link.is_none()
+                    {
+                        ui.add_space(28.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new("Nothing yet").strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "Send something and hand over the link, or paste a link \
+                                     someone sent you.\nGroups you join stay joined until you \
+                                     leave them.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                    }
+
+                    ui.add_space(8.0);
+                });
         });
     }
+}
+
+/// "1.2 of 3.4 MiB", when the total is known.
+fn progress_label(transfer: &bridge::Transfer) -> Option<String> {
+    transfer
+        .total
+        .filter(|&total| total > 0)
+        .map(|total| format!("{} of {}", human_bytes(transfer.done), human_bytes(total)))
+}
+
+/// Same convention the daemon prints: binary units, one decimal.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Errors can be long; the row cannot.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let taken: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{taken}…")
 }
 
 fn parent_of(path: &str) -> &str {
@@ -348,6 +558,7 @@ struct Snapshot {
     lan_only: bool,
     download_dir: String,
     share_link: Option<String>,
+    share_link_name: Option<String>,
     busy: Option<String>,
     error: Option<String>,
     incoming: Vec<bridge::Incoming>,
@@ -363,6 +574,7 @@ impl From<&UiState> for Snapshot {
             lan_only: state.lan_only,
             download_dir: state.download_dir.clone(),
             share_link: state.share_link.clone(),
+            share_link_name: state.share_link_name.clone(),
             busy: state.busy.clone(),
             error: state.error.clone(),
             incoming: state.incoming.clone(),

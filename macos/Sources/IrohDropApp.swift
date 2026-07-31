@@ -38,8 +38,16 @@ struct IrohDropApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
 
+    /// What the menu bar icon should say right now: a question beats
+    /// movement, movement beats rest.
+    private var menuIcon: String {
+        if !model.incoming.isEmpty { return "tray.and.arrow.down.fill" }
+        if !model.activeTransfers.isEmpty { return "arrow.down.circle.fill" }
+        return "arrow.up.arrow.down.circle"
+    }
+
     var body: some Scene {
-        WindowGroup("iroh-drop", id: "main") {
+        WindowGroup("Drop", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .task { model.start() }
@@ -53,11 +61,16 @@ struct IrohDropApp: App {
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            CommandGroup(after: .newItem) {
+                Button("Send Files…") { model.chooseFiles() }
+                    .keyboardShortcut("o", modifiers: .command)
+            }
         }
 
         // A menu bar item that is genuinely useful: a live summary, consent,
         // and the link you just made — without needing the window open.
-        MenuBarExtra("iroh-drop", systemImage: "arrow.up.arrow.down.circle") {
+        // The icon answers "is anything happening?" at a glance.
+        MenuBarExtra("Drop", systemImage: menuIcon) {
             MenuBarContent().environmentObject(model)
         }
         .menuBarExtraStyle(.window)
@@ -75,6 +88,11 @@ private struct MenuBarContent: View {
 
             if !model.incoming.isEmpty {
                 consentSection
+                Divider().padding(.vertical, 8)
+            }
+
+            if !model.available.isEmpty {
+                availableSection
                 Divider().padding(.vertical, 8)
             }
 
@@ -122,6 +140,34 @@ private struct MenuBarContent: View {
                     Button("Decline") { model.answer(item, accept: false) }
                         .controlSize(.small)
                 }
+            }
+        }
+    }
+
+    /// Groups you belong to have news even when the window never opens:
+    /// the menu bar is where most of the app's life happens.
+    private var availableSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("New in your groups")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(model.available.prefix(5)) { offer in
+                HStack {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(offer.name).lineLimit(1).truncationMode(.middle)
+                        Text([offer.size, offer.groupName]
+                            .filter { !$0.isEmpty }
+                            .joined(separator: " · "))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Get") { model.fetch(offer) }
+                        .controlSize(.small)
+                }
+            }
+            if model.available.count > 5 {
+                Text("…and \(model.available.count - 5) more in the window")
+                    .font(.caption).foregroundStyle(.tertiary)
             }
         }
     }

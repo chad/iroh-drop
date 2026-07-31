@@ -4,6 +4,51 @@ import ServiceManagement
 import SwiftUI
 import UserNotifications
 
+extension Notification.Name {
+    /// A consent answer made from a notification action.
+    static let consentAction = Notification.Name("computer.iroh.drop.consentAction")
+    /// "Show in Downloads" tapped on a received-file notification.
+    static let revealPath = Notification.Name("computer.iroh.drop.revealPath")
+}
+
+/// Routes notification taps back into the app through NotificationCenter.
+/// UNUserNotificationCenter requires its delegate be an NSObject, which
+/// AppModel is not, and the delegate must exist before the first response
+/// arrives — so it is a tiny standalone object, wired up in `AppModel.start`.
+final class NotificationRouter: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationRouter()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        let info = response.notification.request.content.userInfo
+        switch response.actionIdentifier {
+        case "ACCEPT", "DECLINE":
+            if let id = (info["askId"] as? NSNumber)?.uint64Value {
+                NotificationCenter.default.post(
+                    name: .consentAction, object: nil,
+                    userInfo: ["id": id, "accept": response.actionIdentifier == "ACCEPT"])
+            }
+        case "SHOW", UNNotificationDefaultActionIdentifier:
+            if let path = info["path"] as? String, !path.isEmpty {
+                NotificationCenter.default.post(
+                    name: .revealPath, object: nil, userInfo: ["path": path])
+            }
+        default:
+            break
+        }
+        completionHandler()
+    }
+
+    /// The app is menu-bar resident: being "frontmost" does not mean anyone
+    /// is looking at the window, so banners stay banners even then.
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .sound])
+    }
+}
+
 /// One thing arriving or leaving.
 struct Transfer: Identifiable {
     let id = UUID()
@@ -11,6 +56,8 @@ struct Transfer: Identifiable {
     /// display name would merge two different files that share one, and split
     /// one file that gets renamed.
     var hash: String
+    /// The drop the bytes are coming from, so a failure can offer Try Again.
+    var drop: String = ""
     var name: String
     /// Carried from the offer, because a small file can finish before any
     /// progress event arrives and the row would otherwise have nothing to say.
@@ -25,11 +72,21 @@ struct Transfer: Identifiable {
         guard let total, total > 0 else { return nil }
         return min(Double(done) / Double(total), 1)
     }
+
+    /// "1.2 of 3.4 MB", when the total is known.
+    var progressLabel: String? {
+        guard let total, total > 0 else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return "\(formatter.string(fromByteCount: Int64(done))) of \(formatter.string(fromByteCount: Int64(total)))"
+    }
 }
 
 /// A consent question waiting on a person.
 struct Incoming: Identifiable {
     let id: UInt64
+    /// The drop the offer arrived in, so the card can say which group.
+    var drop: String = ""
     let name: String
     let size: String
     let sender: String
@@ -122,6 +179,7 @@ final class AppModel: ObservableObject {
     private var helper: Process?
     /// Drops the user asked for, and when. Asking is consent; see `receive`.
     private var requested: [String: Date] = [:]
+    private var dropByHash: [String: String] = [:]
     private var namesByHash: [String: String] = [:]
     private var sizesByHash: [String: String] = [:]
     private var expiryTimer: Timer?
@@ -164,7 +222,49 @@ final class AppModel: ObservableObject {
             Task { @MainActor in self?.pruneExpired() }
         }
 
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        // A safety net, not the mechanism: events drive refresh, but any
+        // event we do not subscribe to (or a missed one) self-heals here.
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+
+        setUpNotifications()
+    }
+
+    private func setUpNotifications() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = NotificationRouter.shared
+        let consent = UNNotificationCategory(
+            identifier: "CONSENT",
+            actions: [
+                UNNotificationAction(identifier: "ACCEPT", title: "Accept"),
+                UNNotificationAction(identifier: "DECLINE", title: "Decline", options: .destructive),
+            ],
+            intentIdentifiers: [])
+        let received = UNNotificationCategory(
+            identifier: "RECEIVED",
+            actions: [UNNotificationAction(identifier: "SHOW", title: "Show in Downloads")],
+            intentIdentifiers: [])
+        center.setNotificationCategories([consent, received])
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+
+        NotificationCenter.default.addObserver(
+            forName: .consentAction, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let id = (note.userInfo?["id"] as? NSNumber)?.uint64Value else { return }
+            let accept = (note.userInfo?["accept"] as? Bool) ?? false
+            Task { @MainActor in
+                self?.client.answer(id: id, accept: accept)
+                self?.incoming.removeAll { $0.id == id }
+                self?.withdrawConsentNotification(id: id)
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .revealPath, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let path = note.userInfo?["path"] as? String else { return }
+            Task { @MainActor in self?.reveal(path: path) }
+        }
     }
 
     private func retryConnect(path: String, attemptsLeft: Int) {
@@ -379,6 +479,7 @@ final class AppModel: ObservableObject {
     func answer(_ incoming: Incoming, accept: Bool) {
         client.answer(id: incoming.id, accept: accept)
         self.incoming.removeAll { $0.id == incoming.id }
+        withdrawConsentNotification(id: incoming.id)
     }
 
     /// Put a fresh link on the pasteboard — the menu bar has no room for a sheet.
@@ -417,6 +518,44 @@ final class AppModel: ObservableObject {
         return connected ? "Ready" : "Not running"
     }
 
+    /// A failed fetch, asked for again. The pick is the offer's name —
+    /// resolve_pick accepts names as well as listing numbers.
+    func retry(_ transfer: Transfer) {
+        guard !transfer.drop.isEmpty else { return }
+        client.call("offer.fetch", ["drop": transfer.drop, "pick": transfer.name]) { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result {
+                self.errorMessage = error.localizedDescription
+            }
+            self.refresh()
+        }
+        if let index = transfers.firstIndex(where: { $0.id == transfer.id }) {
+            transfers[index].finished = false
+            transfers[index].failure = nil
+            transfers[index].done = 0
+        }
+    }
+
+    func clearFinished() {
+        transfers.removeAll { $0.finished }
+    }
+
+    /// ⌘O and the drop-zone button share this.
+    func chooseFiles() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Send"
+        panel.message = "Choose files or a folder to send."
+        if panel.runModal() == .OK { send(urls: panel.urls) }
+    }
+
+    /// What a group is called, for "in Holiday photos" context lines.
+    func groupName(for handle: String) -> String? {
+        shared.first(where: { $0.id == handle })?.name
+    }
+
     func stopSharing(_ drop: SharedDrop) {
         client.call("drop.leave", ["drop": drop.id]) { [weak self] _ in self?.refresh() }
     }
@@ -444,6 +583,7 @@ final class AppModel: ObservableObject {
         let name = ask.payload["name"] as? String ?? "a file"
         let item = Incoming(
             id: ask.id,
+            drop: handle,
             name: name,
             size: ask.payload["human_size"] as? String ?? "",
             sender: String((ask.payload["from"] as? String ?? "").prefix(10)),
@@ -451,14 +591,42 @@ final class AppModel: ObservableObject {
             expiresAt: Date().addingTimeInterval(ttl / 1000 - 2)
         )
         incoming.append(item)
-        notify(name: name, size: item.size)
+        notify(ask: item)
     }
 
-    private func notify(name: String, size: String) {
+    /// The consent question, as a notification with the same answers the
+    /// card has — so it can be answered without the window open at all.
+    private func notify(ask item: Incoming) {
         let content = UNMutableNotificationContent()
         content.title = "Someone wants to send you a file"
-        content.body = size.isEmpty ? name : "\(name) · \(size)"
+        content.body = item.size.isEmpty ? item.name : "\(item.name) · \(item.size)"
         content.sound = .default
+        content.categoryIdentifier = "CONSENT"
+        content.userInfo["askId"] = NSNumber(value: item.id)
+        // A stable identifier is what lets us withdraw the banner the moment
+        // the question is answered or expires — a banner whose Accept button
+        // cannot work is worse than none.
+        let request = UNNotificationRequest(
+            identifier: "consent-\(item.id)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    private func withdrawConsentNotification(id: UInt64) {
+        UNUserNotificationCenter.current()
+            .removeDeliveredNotifications(withIdentifiers: ["consent-\(id)"])
+    }
+
+    /// A file landed. Distinct from the consent notification: this one is
+    /// news, not a question, and tapping it reveals the file.
+    private func notifyReceived(name: String, path: String?) {
+        let content = UNMutableNotificationContent()
+        content.title = "File received"
+        content.body = name
+        content.sound = .default
+        if let path, !path.isEmpty {
+            content.categoryIdentifier = "RECEIVED"
+            content.userInfo["path"] = path
+        }
         let request = UNNotificationRequest(
             identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -466,21 +634,31 @@ final class AppModel: ObservableObject {
 
     private func pruneExpired() {
         let now = Date()
-        let before = incoming.count
+        let expired = incoming.filter { $0.expiresAt <= now }
+        guard !expired.isEmpty else { return }
         incoming.removeAll { $0.expiresAt <= now }
-        if incoming.count != before {
-            status = "An offer expired before anyone answered."
+        for item in expired {
+            withdrawConsentNotification(id: item.id)
         }
+        refreshAvailable()
     }
 
     // MARK: - Events
 
     private func apply(event: String, payload: [String: Any]) {
         let hash = payload["hash"] as? String ?? ""
+        // Everything that carries both remembers which drop a hash lives in,
+        // so fetch.materialized — which carries no drop — can still retry.
+        if let drop = payload["drop"] as? String, !hash.isEmpty {
+            dropByHash[hash] = drop
+        }
         switch event {
         case "offer.received":
             namesByHash[hash] = payload["name"] as? String ?? "file"
             sizesByHash[hash] = payload["human_size"] as? String ?? ""
+            refreshAvailable()
+        case "offer.declined", "offer.answered":
+            refreshAvailable()
         case "fetch.progress":
             let index = slot(for: hash)
             transfers[index].done = (payload["downloaded"] as? NSNumber)?.uint64Value ?? 0
@@ -489,12 +667,13 @@ final class AppModel: ObservableObject {
             let index = slot(for: hash)
             transfers[index].finished = true
             transfers[index].savedTo = (payload["paths"] as? [String]) ?? []
+            notifyReceived(name: transfers[index].name, path: transfers[index].savedTo.first)
             refresh()
         case "fetch.failed":
             let index = slot(for: hash)
             transfers[index].finished = true
             transfers[index].failure = payload["error"] as? String ?? "it did not arrive"
-        case "peer.joined", "drop.joined", "drop.left":
+        case "peer.joined", "peer.left", "drop.joined", "drop.left":
             refresh()
         default:
             break
@@ -505,6 +684,7 @@ final class AppModel: ObservableObject {
     private func slot(for hash: String) -> Int {
         if let index = transfers.firstIndex(where: { $0.hash == hash }) { return index }
         transfers.append(Transfer(hash: hash,
+                                  drop: dropByHash[hash] ?? "",
                                   name: namesByHash[hash] ?? "file",
                                   size: sizesByHash[hash] ?? ""))
         return transfers.count - 1
