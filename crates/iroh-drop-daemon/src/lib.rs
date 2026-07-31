@@ -45,6 +45,7 @@
 
 pub mod client;
 pub mod frame;
+pub mod persist;
 pub mod service;
 pub mod transport;
 

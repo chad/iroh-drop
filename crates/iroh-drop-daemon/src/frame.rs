@@ -118,6 +118,17 @@ impl Hello {
             roles: vec![Role::Ui, Role::Control],
         }
     }
+
+    /// A client that drives transfers but never answers consent questions —
+    /// e.g. the CLI. Deliberately not [`Role::Ui`]: a control-only client must
+    /// never have an ask routed to it.
+    pub fn control(client: impl Into<String>) -> Self {
+        Self {
+            client: client.into(),
+            api: API_VERSION,
+            roles: vec![Role::Control],
+        }
+    }
 }
 
 /// A client's declared capabilities.

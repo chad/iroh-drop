@@ -328,14 +328,18 @@ impl DropSession {
         let mut ticket = self.inner.ticket.read().clone();
         let state = self.inner.state.read();
         let mut nodes: Vec<iroh::EndpointAddr> = ticket.bootstrap_nodes().to_vec();
-        let mut have: std::collections::HashSet<EndpointId> = nodes.iter().map(|a| a.id).collect();
         // A ticket handed out by a live peer must point at that peer: whoever
         // receives it can then reach us even if the original publisher is
         // gone. Our full address is included, which also works offline.
+        //
+        // Any existing entry for our own id is stale and must be replaced,
+        // not just deduped against: after a restart we come back with the
+        // same identity but a freshly bound port, and a ticket that keeps the
+        // old entry points every joiner at our own ghost.
         let self_addr = self.inner.stack.addr();
-        if have.insert(self_addr.id) {
-            nodes.insert(0, self_addr);
-        }
+        nodes.retain(|a| a.id != self_addr.id);
+        nodes.insert(0, self_addr.clone());
+        let mut have: std::collections::HashSet<EndpointId> = nodes.iter().map(|a| a.id).collect();
         for peer in &state.known_peers {
             if nodes.len() >= crate::ticket::MAX_BOOTSTRAP_NODES {
                 break;
@@ -1103,9 +1107,10 @@ impl DropSession {
             .map_err(|e| DropError::Network(NetworkError::Gossip(e.to_string())))
     }
 
-    /// Shut the session down: announce withdrawal for everything we serve,
-    /// then stop the gossip loop and all fetch tasks.
-    pub async fn shutdown(self) -> Result<(), DropError> {
+    /// Announce withdrawal for everything we serve, without stopping. A
+    /// deliberate, polite leave uses this before [`Self::shutdown_no_announce`];
+    /// a crash cannot, which is the case `publisher_exit.rs` covers.
+    pub async fn announce_withdrawal(&self) {
         let complete: Vec<BlobHash> = {
             let state = self.inner.state.read();
             state
@@ -1126,7 +1131,94 @@ impl DropSession {
             )
             .await;
         }
+    }
+
+    /// Shut the session down: announce withdrawal for everything we serve,
+    /// then stop the gossip loop and all fetch tasks.
+    pub async fn shutdown(self) -> Result<(), DropError> {
+        self.announce_withdrawal().await;
         self.shutdown_no_announce().await;
+        Ok(())
+    }
+
+    /// Every retained signed frame — the replayable history of this drop,
+    /// suitable for persisting so a restart can reconstruct the drop rather
+    /// than merely its blob cache. Bounded by the retained-history cap.
+    pub fn export_history(&self) -> Vec<Bytes> {
+        let mut frames = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let page = self.inner.state.read().sync_frames(cursor, 256);
+            if page.frames.is_empty() {
+                break;
+            }
+            cursor = page.end_cursor;
+            frames.extend(page.frames);
+            if page.caught_up {
+                break;
+            }
+        }
+        frames
+    }
+
+    /// Replay persisted frames into state after a restart. Frames are verified
+    /// by the same `MessageV1::decode` as live traffic and applied through the
+    /// same `DropState` transitions — but as *history*, not live traffic: no
+    /// peer credit, no decider, no auto-fetch, no events, no rebroadcast. Live
+    /// gossip re-propagates whatever is still current.
+    ///
+    /// Returns how many frames applied.
+    pub async fn restore_history(&self, frames: Vec<Bytes>) -> usize {
+        let mut applied = 0;
+        for frame in frames {
+            let Ok(verified) = MessageV1::decode(&frame) else {
+                continue;
+            };
+            let author = verified.author;
+            let message = verified.message;
+            let mut state = self.inner.state.write();
+            if !state.seen_messages.check_and_insert((author, message.id)) {
+                continue;
+            }
+            match message.body.decode() {
+                Ok(Some(MessageBodyV1::Offer(offer))) => {
+                    state.retain_frame(Bytes::copy_from_slice(&frame));
+                    state.record_restored(author, offer);
+                    applied += 1;
+                }
+                Ok(Some(MessageBodyV1::Provider(provider))) => {
+                    state.retain_frame(Bytes::copy_from_slice(&frame));
+                    let announced_at = provider.announced_at_ms.unwrap_or(0);
+                    match provider.state {
+                        ProviderState::Available => {
+                            state.record_provider(provider.blob_hash, author, announced_at);
+                        }
+                        ProviderState::Withdrawing => {
+                            state.withdraw_provider(provider.blob_hash, author, announced_at);
+                        }
+                    }
+                    applied += 1;
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    // Requests and unknown kinds are not retained history; skip.
+                }
+                Err(_) => {}
+            }
+        }
+        applied
+    }
+
+    /// Re-announce that we serve `hash` — used after a restart restores state,
+    /// so the group learns our availability again without a new fetch. Only
+    /// announces when the blob is actually complete in the local store.
+    pub async fn reannounce(&self, hash: &BlobHash) -> Result<(), DropError> {
+        self.mark_complete(hash, None).await?;
+        self.broadcast(MessageBodyV1::Provider(ProviderV1 {
+            blob_hash: *hash,
+            state: ProviderState::Available,
+            announced_at_ms: Some(now_ms()),
+        }))
+        .await?;
         Ok(())
     }
 

@@ -1,8 +1,9 @@
-# The daemon control API (U4) — design sketch
+# The daemon control API (U4)
 
-Status: **proposal**. Nothing here changes bytes on the wire; this is the UX
-layer's API, and it must be buildable by a third party against the existing
-public protocol API (see `docs/roadmap.md`'s boundary rule).
+Status: **implemented** (`iroh-drop-daemon`, with the macOS app and the CLI
+as its first two clients). Nothing here changes bytes on the wire; this is
+the UX layer's API, and it is buildable by a third party against the public
+protocol API (see `docs/roadmap.md`'s boundary rule).
 
 ## What the daemon is for
 
@@ -90,7 +91,36 @@ with `op = 65535` instead of hanging up.
   version-sniff. Same reasoning as `HelloV1::ops`.
 - `roles`: `observer` (events only), `ui` (may be sent `ask`), `control`
   (may publish/fetch/leave). A menu-bar app is `["ui","control"]`; a status
-  widget is `["observer"]`.
+  widget is `["observer"]`; the CLI's mutating commands are `["control"]`.
+  Roles are **enforced centrally** in dispatch, not advisory: mutating
+  methods (`drop.create`, `drop.join`, `drop.leave`, `offer.publish`,
+  `offer.fetch`, `task.cancel`) answer `forbidden` without `control`, and
+  `drop.ticket` — which reveals the bearer capability — requires `ui` or
+  `control`. Read methods (`daemon.status`, lists, `events.replay`) are open
+  to every role. The socket itself is user-private (0600 dir on Unix), so
+  this is defense in depth and a contract third-party clients can rely on.
+
+## Persistence: drops outlive the daemon
+
+The blob store already survives restarts; the drop *memberships* now do too.
+Beside the blob store (`<store>-daemon/`) the daemon keeps, per drop:
+
+- `drops.json` — handle, display name, and the full ticket (bootstrap
+  addresses possibly stale; a join does not need any of them reachable);
+- `frames-<topic>.bin` — the drop's retained, *signed* history.
+
+Writes are debounced (250 ms) on every state-changing event, and a final
+write happens at shutdown; files are `0600`, written temp-then-renamed. On
+startup the daemon rejoins every drop in the table, replays the retained
+frames through the same signature verification and state transitions as live
+traffic (without re-running deciders — a restart must not re-ask consent for
+last week's offers), and re-announces whatever the local store still holds
+complete. Handles stay stable across restarts, so scripts and UIs never see
+a drop rename itself.
+
+`drop.leave` is the opposite of persistence: it announces withdrawal to the
+group, then *deletes* the persisted state — a deliberate leave is forgotten,
+a crash is not.
 
 ## Methods
 

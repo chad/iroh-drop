@@ -51,7 +51,7 @@ pub async fn send(
     qr: bool,
     socket: Option<PathBuf>,
 ) -> Result<()> {
-    let client = attach(socket, Hello::observer("iroh-drop send"), None).await?;
+    let client = attach(socket, Hello::control("iroh-drop send"), None).await?;
 
     let created = client
         .call("drop.create", json!({"name": name}))
@@ -231,7 +231,7 @@ pub async fn get(
 ) -> Result<()> {
     // An observer, not a UI: asking for a file *is* the consent, and being a
     // UI here would download it a second time through the consent path.
-    let client = attach(socket, Hello::observer("iroh-drop get"), None).await?;
+    let client = attach(socket, Hello::control("iroh-drop get"), None).await?;
     let ticket = crate::read_ticket(&ticket)?.to_string();
 
     let joined = client
@@ -311,7 +311,7 @@ pub async fn get(
 /// and be prompted as things appear) and the only way to exercise the consent
 /// prompt deliberately.
 pub async fn join(ticket: String, socket: Option<PathBuf>) -> Result<()> {
-    let client = attach(socket, Hello::observer("iroh-drop join"), None).await?;
+    let client = attach(socket, Hello::control("iroh-drop join"), None).await?;
     let ticket = crate::read_ticket(&ticket)?.to_string();
     let joined = client
         .call("drop.join", json!({"ticket": ticket}))

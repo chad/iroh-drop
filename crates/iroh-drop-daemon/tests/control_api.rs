@@ -146,7 +146,7 @@ async fn offer_without_a_ui_is_declined() {
         .await
         .expect("client a");
     // Observer only: receives events, is never asked, cannot consent.
-    let client_b = Client::connect_memory(&b, Hello::observer("test-b"), None)
+    let client_b = Client::connect_memory(&b, Hello::control("test-b"), None)
         .await
         .expect("client b");
 
@@ -229,7 +229,7 @@ async fn a_configured_base_adds_a_web_link() {
     options.link_base = Some("https://drop.example/".into());
 
     let service = Service::new(options).await.expect("service");
-    let client = Client::connect_memory(&service, Hello::observer("test"), None)
+    let client = Client::connect_memory(&service, Hello::control("test"), None)
         .await
         .expect("client");
     let drop = client
@@ -270,11 +270,11 @@ async fn a_windowless_helper_still_serves() {
     receiver_options.auto_accept = true;
     let receiver = Service::new(receiver_options).await.expect("receiver");
 
-    let client_a = Client::connect_memory(&sender, Hello::observer("sender"), None)
+    let client_a = Client::connect_memory(&sender, Hello::control("sender"), None)
         .await
         .expect("sender client");
     // Only an *observer* on the receiver — never a UI.
-    let client_b = Client::connect_memory(&receiver, Hello::observer("watcher"), None)
+    let client_b = Client::connect_memory(&receiver, Hello::control("watcher"), None)
         .await
         .expect("watcher");
 
@@ -332,7 +332,7 @@ async fn auto_accept_does_not_bypass_a_live_ui() {
     receiver_options.auto_accept = true; // the helper's posture
     let receiver = Service::new(receiver_options).await.expect("receiver");
 
-    let client_a = Client::connect_memory(&sender, Hello::observer("sender"), None)
+    let client_a = Client::connect_memory(&sender, Hello::control("sender"), None)
         .await
         .expect("sender client");
 
@@ -345,7 +345,7 @@ async fn auto_accept_does_not_bypass_a_live_ui() {
     )
     .await
     .expect("refuser client");
-    let watcher = Client::connect_memory(&receiver, Hello::observer("watcher"), None)
+    let watcher = Client::connect_memory(&receiver, Hello::control("watcher"), None)
         .await
         .expect("watcher");
 
@@ -378,4 +378,149 @@ async fn auto_accept_does_not_bypass_a_live_ui() {
 
     Arc::clone(&sender).shutdown().await;
     Arc::clone(&receiver).shutdown().await;
+}
+
+/// The roles a client declares at hello are enforced centrally: an observer
+/// watches, it does not mutate, and it is never handed a bearer capability.
+#[tokio::test]
+async fn observer_cannot_mutate() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let service = Service::new(options(tmp.path(), "svc"))
+        .await
+        .expect("service");
+    let observer = Client::connect_memory(&service, Hello::observer("watcher"), None)
+        .await
+        .expect("observer");
+
+    for method in ["drop.create", "drop.join", "offer.publish", "offer.fetch", "task.cancel"] {
+        let err = observer
+            .call(method, json!({}))
+            .await
+            .expect_err("observer must not mutate");
+        assert_eq!(err.code, "forbidden", "{method}");
+    }
+    // A ticket is the bearer capability: observers do not get one either.
+    let err = observer
+        .call("drop.ticket", json!({"drop": "d1"}))
+        .await
+        .expect_err("observer must not see tickets");
+    assert_eq!(err.code, "forbidden");
+
+    // Reads are fine.
+    observer.call("daemon.status", json!({})).await.expect("status");
+    observer.call("drop.list", json!({})).await.expect("list");
+
+    // And a control client drives.
+    let control = Client::connect_memory(&service, Hello::control("driver"), None)
+        .await
+        .expect("control");
+    control
+        .call("drop.create", json!({}))
+        .await
+        .expect("control creates");
+
+    Arc::clone(&service).shutdown().await;
+}
+
+/// The review's scenario, end to end at the daemon level: A publishes, B
+/// replicates, everything shuts down, B comes back from disk alone, and a
+/// brand-new C still finds the drop's contents by name and fetches them.
+#[tokio::test]
+async fn a_restarted_daemon_rejoins_its_drops() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let payload = tmp.path().join("report.pdf");
+    std::fs::write(&payload, b"the report must survive us all\n").expect("write payload");
+
+    // A creates and publishes.
+    let a = Service::new(options(tmp.path(), "a")).await.expect("a");
+    let client_a = Client::connect_memory(&a, Hello::control("a"), None)
+        .await
+        .expect("client a");
+    let drop_a = client_a
+        .call("drop.create", json!({}))
+        .await
+        .expect("create")["drop"]
+        .clone();
+    client_a
+        .call(
+            "offer.publish",
+            json!({"drop": drop_a, "path": payload.to_str().expect("utf8")}),
+        )
+        .await
+        .expect("publish");
+    let ticket = full_ticket(&client_a, &drop_a).await;
+
+    // B joins and replicates (auto-accept: no UI attached).
+    let mut b_options = options(tmp.path(), "b");
+    b_options.auto_accept = true;
+    let b = Service::new(b_options).await.expect("b");
+    let client_b = Client::connect_memory(&b, Hello::control("b"), None)
+        .await
+        .expect("client b");
+    let drop_b = client_b
+        .call("drop.join", json!({"ticket": ticket}))
+        .await
+        .expect("join")["drop"]
+        .clone();
+    client_b
+        .wait_for(TIMEOUT, |env| env.e == "fetch.materialized")
+        .await
+        .expect("b replicated");
+
+    // Everything stops. No live peer remains anywhere. The drops below
+    // matter: a live Arc<Service> keeps the blob store open, and the rebuilt
+    // daemon would wait on its lock forever.
+    eprintln!("[t] shutting down both daemons");
+    Arc::clone(&a).shutdown().await;
+    Arc::clone(&b).shutdown().await;
+    drop(client_a);
+    drop(client_b);
+    drop(a);
+    drop(b);
+    // Let the in-memory connection tasks (which hold Arc<Service>) unwind.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // B returns from disk alone: same store, same identity, empty memory.
+    eprintln!("[t] rebuilding B from disk");
+    let mut b2_options = options(tmp.path(), "b");
+    b2_options.auto_accept = true;
+    let b2 = Service::new(b2_options).await.expect("b2");
+    let client_b2 = Client::connect_memory(&b2, Hello::control("b2"), None)
+        .await
+        .expect("client b2");
+
+    // The drop is back, under its stable handle, with its history.
+    let drops = client_b2.call("drop.list", json!({})).await.expect("list");
+    let restored = drops["drops"].as_array().expect("array").clone();
+    assert_eq!(restored.len(), 1, "one drop restored: {drops}");
+    assert_eq!(restored[0]["drop"], json!(drop_b), "handle is stable");
+    assert_eq!(restored[0]["files"], json!(1), "inventory survived");
+    let ticket_b2 = full_ticket(&client_b2, &restored[0]["drop"]).await;
+
+    eprintln!("[t] B restored; starting C");
+    // C is brand new. It joins from the restarted B and must learn the drop
+    // by name and fetch the bytes — B's disk is the only source left.
+    let mut c_options = options(tmp.path(), "c");
+    c_options.auto_accept = true;
+    let c = Service::new(c_options).await.expect("c");
+    let client_c = Client::connect_memory(&c, Hello::control("c"), None)
+        .await
+        .expect("client c");
+    client_c
+        .call("drop.join", json!({"ticket": ticket_b2}))
+        .await
+        .expect("c joins");
+    let offer = client_c
+        .wait_for(TIMEOUT, |env| env.e == "offer.received")
+        .await
+        .expect("c learned the inventory from restarted B");
+    assert_eq!(offer.p["name"], json!("report.pdf"));
+    client_c
+        .wait_for(TIMEOUT, |env| env.e == "fetch.materialized")
+        .await
+        .expect("c fetched from restarted B");
+    assert!(tmp.path().join("c-downloads/report.pdf").exists());
+
+    Arc::clone(&b2).shutdown().await;
+    Arc::clone(&c).shutdown().await;
 }

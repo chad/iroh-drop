@@ -32,9 +32,11 @@ protocol** — with a hard boundary between the protocol and the UX built on it.
 
 ## Protocol versioning governance
 
-- `WIRE_VERSION` stays `1`. Two extension paths, both used already:
+- `WIRE_VERSION` is `2` (since v0.4: kind-tagged bodies, P7). Bumping it is
+  the *last* resort — reserved for changes old decoders cannot tolerate.
+  Two extension paths, both used already, both preferred over a bump:
   - **additive optional fields** on postcard structs (old readers tolerate
-    trailing bytes) — preferred for v1.x features.
+    trailing bytes) — preferred for v2.x features.
   - **new capabilities on the control ALPN** `/iroh-drop/1` — the sync
     protocol is the first; each control request carries its own version.
 - Adding a `MessageBodyV1` variant is *breaking* for old decoders (clean
@@ -86,7 +88,7 @@ protocol** — with a hard boundary between the protocol and the UX built on it.
 - **v0.2 (shipped)**: P1, P2, U1–U3. Protocol gained catch-up sync and
   persistent identity; the SDK crate established the boundary; the CLI gained
   `share`/`receive`, numbered picks, folders, and a config file. Wire format
-  unchanged (`WIRE_VERSION = 1`).
+  unchanged (still `WIRE_VERSION = 1` at the time).
 - **v0.3 (shipped)**: onboarding — U7 (mDNS), U8 (QR), U9 (short tickets by
   default), U10 (rooms), U11 (LAN drop discovery). Nothing here touched the
   wire: it is all naming, discovery, and transport of one string.
@@ -94,11 +96,23 @@ protocol** — with a hard boundary between the protocol and the UX built on it.
   `#[non_exhaustive]` on public enums and `parking_lot` locks (no poisoning
   cascades). This is the last comfortable moment for a frame-layout change,
   which is why kind tagging happened now.
-- **v0.4.x**: U4 daemon + control API; P4 series/TTL; `watch` UX.
-  The daemon is the gate on everything decentralized: without a process that
-  outlives a terminal, no peer is durable and "every recipient becomes a
-  provider" stays theoretical. Contacts and per-transfer advertisement are
-  polish on top of a network that already works, so they queue behind it.
+- **v0.4.x (shipped)**: U4 daemon + control API; `watch` UX; the macOS app
+  (U17); windowless auto-accept helper with consent arbitration. The daemon
+  was the gate on everything decentralized: without a process that outlives
+  a terminal, no peer is durable and "every recipient becomes a provider"
+  stays theoretical.
+- **v0.4.y (shipped)**: the durability follow-through, after an external
+  architecture review. Drops (not just blobs) persist across daemon
+  restarts — retained signed history replayed on rejoin, complete blobs
+  re-announced, handles stable; `drop.leave` now announces withdrawal
+  instead of faking a crash, and forgets the drop; client roles are enforced
+  in dispatch instead of being advisory; and a restored node's tickets no
+  longer point at its own pre-restart ghost (self-address is *replaced* in
+  `session.ticket()`, not deduped against). Two of those were caught only by
+  the cold-restart integration tests — the review's core scenario, now
+  running end to end: publish, replicate, kill everything, restart one side,
+  a brand-new peer still finds the drop by name and fetches it. P4 series/TTL
+  remains open.
 - **v0.5**: P3 swarm fetch (spike first); U5 MCP server.
 - **v0.6**: P5/P6 v2 family (private drops, tombstones); U6 TUI. Private
   drops are also what would make `--lan` safe on untrusted networks, and are

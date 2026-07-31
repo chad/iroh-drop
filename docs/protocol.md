@@ -34,10 +34,10 @@ SignedMessageV1 {                  // the frame put on the gossip topic
     payload:  Vec<u8>,             // postcard(MessageV1)
     signature: [u8; 64],           // ed25519 over SIGN_DOMAIN || payload
 }
-SIGN_DOMAIN = b"iroh-drop/v1/message/"
+SIGN_DOMAIN = b"iroh-drop/v2/message/"
 
 MessageV1 {
-    version:    u16,               // == 1 (WIRE_VERSION)
+    version:    u16,               // == 2 (WIRE_VERSION)
     id:         [u8; 16],          // random, for dedup (10k entries / 10 min)
     sent_at_ms: u64,               // informational only
     body:       MessageBodyV1,

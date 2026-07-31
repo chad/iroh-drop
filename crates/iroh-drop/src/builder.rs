@@ -21,7 +21,7 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::endpoint_info::UserData;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store;
 use iroh_blobs::store::fs::FsStore;
@@ -110,7 +110,7 @@ impl DropStack {
         }
         #[cfg(feature = "mdns")]
         let mdns = if options.mdns {
-            let endpoint_id = EndpointId::from(secret.public());
+            let endpoint_id = iroh::EndpointId::from(secret.public());
             match MdnsAddressLookup::builder().build(endpoint_id) {
                 Ok(mdns) => Some(mdns),
                 Err(e) => {

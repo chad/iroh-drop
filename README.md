@@ -328,7 +328,7 @@ removal and no private drops yet — see the roadmap.
 ## Development
 
 ```sh
-cargo test --workspace     # 97 tests, 3 #[ignore]d (live mDNS + internet)
+cargo test --workspace     # 100 tests, 3 #[ignore]d (live mDNS + internet)
 cargo test --workspace -- --ignored   # + live mDNS and internet tests
 cargo clippy --workspace --all-targets
 cargo run -p iroh-drop --example four_peer_drop

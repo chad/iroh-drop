@@ -47,7 +47,7 @@ async fn publish_one(
 ) -> (Arc<Service>, String) {
     let service = Service::new(options(dir, name)).await.expect("service");
     let client =
-        iroh_drop_daemon::Client::connect_memory(&service, Hello::observer("sender"), None)
+        iroh_drop_daemon::Client::connect_memory(&service, Hello::control("sender"), None)
             .await
             .expect("client");
     let drop = client
@@ -178,7 +178,7 @@ fn declining_an_unsolicited_offer_writes_nothing() {
 
     // Something else joins the drop: not the user, not through the app.
     recv_runtime.block_on(async {
-        let other = connect(&sock, Hello::observer("someone-else"), None)
+        let other = connect(&sock, Hello::control("someone-else"), None)
             .await
             .expect("second client");
         other

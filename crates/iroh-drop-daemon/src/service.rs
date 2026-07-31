@@ -4,7 +4,7 @@
 //! window closes, and content you received keeps being served — which is the
 //! only way the replication design does anything in practice.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::frame::{Envelope, Frame, Hello, Role, API_VERSION};
+use crate::persist::{DropStore, PersistedDrop};
 
 /// How long a consent question waits before defaulting to deny.
 ///
@@ -70,6 +71,9 @@ impl ApiError {
     }
     fn internal(msg: impl std::fmt::Display) -> Self {
         Self::new("internal", msg)
+    }
+    fn forbidden(msg: impl std::fmt::Display) -> Self {
+        Self::new("forbidden", msg)
     }
 }
 
@@ -311,6 +315,8 @@ pub struct Service {
     asks: AskRouter,
     /// Last time we emitted progress for a blob, for coalescing.
     progress_seen: Mutex<HashMap<String, Instant>>,
+    /// Drops with a persistence write scheduled, for debouncing.
+    persist_pending: Mutex<HashSet<String>>,
 }
 
 impl std::fmt::Debug for Service {
@@ -345,7 +351,7 @@ impl Service {
         .await
         .map_err(ApiError::internal)?;
 
-        Ok(Arc::new(Self {
+        let service = Arc::new(Self {
             protocol,
             options,
             drops: Mutex::new(HashMap::new()),
@@ -355,7 +361,14 @@ impl Service {
             bus: EventBus::new(),
             asks: AskRouter::new(),
             progress_seen: Mutex::new(HashMap::new()),
-        }))
+            persist_pending: Mutex::new(HashSet::new()),
+        });
+        // A daemon that restarts rejoins its drops: persistence is what makes
+        // "the drop outlives its publisher" survive a cold start of every
+        // replica, not just of the blob cache. Best-effort — a corrupt file
+        // must never keep the daemon down.
+        service.restore_drops().await;
+        Ok(service)
     }
 
     /// This daemon's stable endpoint id.
@@ -477,7 +490,7 @@ impl Service {
             while let Some(frame) = inbound.recv().await {
                 match frame {
                     Frame::Req { id, m, p } => {
-                        let reply = match service.dispatch(&m, p).await {
+                        let reply = match service.dispatch(&hello.roles, &m, p).await {
                             Ok(p) => Frame::Res { id, p },
                             Err(e) => Frame::Err {
                                 id,
@@ -512,7 +525,35 @@ impl Service {
     /// Run one method. Unknown names get a clean `unsupported`, never a
     /// dropped connection — the same courtesy the wire protocol's control
     /// channel extends to unknown ops.
-    pub async fn dispatch(self: &Arc<Self>, method: &str, params: Value) -> ApiResult {
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        roles: &[Role],
+        method: &str,
+        params: Value,
+    ) -> ApiResult {
+        // Central role enforcement. The socket is already user-private, so
+        // this is defense in depth — and the contract docs/daemon-api.md
+        // states. A read-only observer must not be able to mutate, and a
+        // ticket (the bearer capability) is only handed to clients that act
+        // for the user.
+        match method {
+            "drop.create" | "drop.join" | "drop.leave" | "offer.publish" | "offer.fetch"
+            | "task.cancel"
+                if !roles.contains(&Role::Control) =>
+            {
+                return Err(ApiError::forbidden(format!(
+                    "{method} requires the control role"
+                )));
+            }
+            "drop.ticket"
+                if !roles.iter().any(|r| matches!(r, Role::Ui | Role::Control)) =>
+            {
+                return Err(ApiError::forbidden(
+                    "drop.ticket reveals the bearer capability; ui or control role required",
+                ));
+            }
+            _ => {}
+        }
         match method {
             "hello" => Err(ApiError::new("already_hello", "hello was already sent")),
             "daemon.status" => self.daemon_status(),
@@ -555,6 +596,7 @@ impl Service {
             .await
             .map_err(ApiError::internal)?;
         let handle = self.register(session, name);
+        self.schedule_persist(&handle);
         let entry = self.entry(&handle)?;
         Ok(json!({
             "drop": handle,
@@ -577,6 +619,7 @@ impl Service {
             .await
             .map_err(ApiError::internal)?;
         let handle = self.register(session, None);
+        self.schedule_persist(&handle);
         let entry = self.entry(&handle)?;
         Ok(json!({
             "drop": handle,
@@ -641,9 +684,18 @@ impl Service {
                 .remove(&handle)
                 .ok_or_else(|| ApiError::not_found(format!("no drop {handle}")))?
         };
-        // Withdraw politely; a crash cannot, which is the case
-        // `publisher_exit.rs` already covers.
+        // Withdraw politely: tell the group we stop serving before we go.
+        // A crash cannot, which is the case `publisher_exit.rs` covers — but a
+        // deliberate leave is not a crash, and leaving stale provider
+        // advertisements behind makes peers waste fetches on a ghost.
+        let topic = entry.session.topic_id().to_string();
+        entry.session.announce_withdrawal().await;
         entry.session.shutdown_no_announce().await;
+        // Deliberate leave = forgotten, not persisted.
+        if let Some(store) = DropStore::for_options(&self.options) {
+            store.remove_drop(&topic);
+            store.save_table(&self.persisted_table());
+        }
         self.bus.emit("drop.left", json!({"drop": handle}));
         Ok(json!({}))
     }
@@ -681,6 +733,7 @@ impl Service {
 
         let session = Arc::clone(&entry.session);
         let service = Arc::clone(self);
+        let persist_handle = handle.clone();
         Ok(self.spawn_task("publish", &handle, None, move |task| async move {
             match publish_path(&session, &path, name).await {
                 Ok(published) => {
@@ -696,6 +749,9 @@ impl Service {
                             "is_collection": published.is_collection,
                         }),
                     );
+                    // Our own broadcast produces no session event, so the
+                    // new frames would otherwise wait for the next trigger.
+                    service.schedule_persist(&persist_handle);
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
@@ -796,6 +852,124 @@ impl Service {
 
     /// Take ownership of a session: give it a short handle and start pumping
     /// its events onto the bus.
+    /// Rejoin every drop found in the persistent table, replay its retained
+    /// history, and re-announce whatever the local store still holds.
+    async fn restore_drops(self: &Arc<Self>) {
+        let Some(store) = DropStore::for_options(&self.options) else {
+            return;
+        };
+        let persisted = store.load_table();
+        if persisted.is_empty() {
+            return;
+        }
+        let mut max_handle = 0u64;
+        for pd in persisted {
+            if let Some(n) = pd.handle.strip_prefix('d').and_then(|s| s.parse().ok()) {
+                max_handle = max_handle.max(n);
+            }
+            let topic = {
+                let Ok(ticket) = pd.ticket.parse::<DropTicket>() else {
+                    warn!(handle = %pd.handle, "restore: skipping drop with unparseable ticket");
+                    continue;
+                };
+                let Ok(session) = self.protocol.join(ticket).await else {
+                    warn!(handle = %pd.handle, "restore: could not rejoin drop");
+                    continue;
+                };
+                let frames: Vec<bytes::Bytes> = store
+                    .load_frames(&session.topic_id().to_string())
+                    .into_iter()
+                    .map(bytes::Bytes::from)
+                    .collect();
+                if !frames.is_empty() {
+                    let applied = session.restore_history(frames).await;
+                    debug!(handle = %pd.handle, applied, "restore: replayed history");
+                }
+                // Serve again whatever the store still holds complete.
+                for record in session.offers() {
+                    let _ = session.reannounce(&record.offer.blob_hash).await;
+                }
+                let topic = session.topic_id().to_string();
+                self.register_restored(pd.handle.clone(), session, pd.name);
+                topic
+            };
+            debug!(handle = %pd.handle, %topic, "restore: drop rejoined");
+        }
+        // Fresh handles must never collide with restored ones.
+        self.next_drop.fetch_max(max_handle + 1, Ordering::SeqCst);
+    }
+
+    fn register_restored(self: &Arc<Self>, handle: String, session: DropSession, name: Option<String>) {
+        let session = Arc::new(session);
+        self.drops.lock().expect("drops").insert(
+            handle.clone(),
+            DropEntry {
+                session: Arc::clone(&session),
+                name,
+            },
+        );
+        self.bus.emit(
+            "drop.joined",
+            json!({"drop": handle, "topic": session.topic_id().to_string(), "restored": true}),
+        );
+        self.spawn_pump(handle.clone(), session);
+    }
+
+    /// Persist one drop's table row and retained history, debounced. Called
+    /// on every state-changing session event; the 250ms coalescing window
+    /// keeps a busy drop from rewriting files per frame.
+    fn schedule_persist(self: &Arc<Self>, handle: &str) {
+        if DropStore::for_options(&self.options).is_none() {
+            return;
+        }
+        {
+            let mut pending = self.persist_pending.lock().expect("persist_pending");
+            if !pending.insert(handle.to_string()) {
+                return;
+            }
+        }
+        let service = Arc::clone(self);
+        let handle = handle.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            service
+                .persist_pending
+                .lock()
+                .expect("persist_pending")
+                .remove(&handle);
+            service.persist_drop(&handle);
+        });
+    }
+
+    fn persist_drop(&self, handle: &str) {
+        let Some(store) = DropStore::for_options(&self.options) else {
+            return;
+        };
+        let Ok(entry) = self.entry(handle) else {
+            return; // left in the meantime
+        };
+        let frames: Vec<Vec<u8>> = entry
+            .session
+            .export_history()
+            .into_iter()
+            .map(|b| b.to_vec())
+            .collect();
+        store.save(&self.persisted_table(), &entry.session.topic_id().to_string(), &frames);
+    }
+
+    fn persisted_table(&self) -> Vec<PersistedDrop> {
+        self.drops
+            .lock()
+            .expect("drops")
+            .iter()
+            .map(|(handle, entry)| PersistedDrop {
+                handle: handle.clone(),
+                name: entry.name.clone(),
+                ticket: entry.session.ticket().to_string(),
+            })
+            .collect()
+    }
+
     fn register(self: &Arc<Self>, session: DropSession, name: Option<String>) -> String {
         let handle = format!("d{}", self.next_drop.fetch_add(1, Ordering::SeqCst));
         let session = Arc::new(session);
@@ -931,6 +1105,9 @@ impl Service {
             }
             other => debug!("unmapped session event: {other:?}"),
         }
+        // Anything a session tells us may have changed its retained history.
+        // Debounced; cheap when nothing changed.
+        self.schedule_persist(d);
     }
 
     /// The consent flow that replaces a blocking decider.
@@ -1083,6 +1260,15 @@ impl Service {
     /// byte it holds. `tests/socket_transport.rs` pins this: it asserts that a
     /// shut-down publisher cannot be the provider of a later fetch.
     pub async fn shutdown(self: Arc<Self>) {
+        // Final persist before we go: the debounced writes may not have run.
+        // Shutdown stays crash-shaped (no withdrawal) — deliberate leaving is
+        // what drop.leave is for.
+        if DropStore::for_options(&self.options).is_some() {
+            let handles: Vec<String> = self.drops.lock().expect("drops").keys().cloned().collect();
+            for handle in &handles {
+                self.persist_drop(handle);
+            }
+        }
         let entries: Vec<DropEntry> = {
             let mut drops = self.drops.lock().expect("drops");
             drops.drain().map(|(_, v)| v).collect()

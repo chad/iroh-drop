@@ -412,8 +412,19 @@ impl DropState {
 
     /// Record an offer, enforcing per-author quotas and the table cap.
     pub fn record_offer_bounded(&mut self, from: EndpointId, offer: OfferV1) -> OfferOutcome {
-        let hash = offer.blob_hash;
         self.note_peer(from);
+        self.record_offer_inner(from, offer)
+    }
+
+    /// Apply an offer from restored history. Identical bookkeeping to
+    /// [`Self::record_offer_bounded`] except the author is not credited as a
+    /// connected peer — a signature from the past is not a connection.
+    pub fn record_restored(&mut self, from: EndpointId, offer: OfferV1) -> OfferOutcome {
+        self.record_offer_inner(from, offer)
+    }
+
+    fn record_offer_inner(&mut self, from: EndpointId, offer: OfferV1) -> OfferOutcome {
+        let hash = offer.blob_hash;
         let known = self.offers.contains_key(&hash);
         if !known && !self.author_has_quota(from) {
             return OfferOutcome::QuotaExceeded;

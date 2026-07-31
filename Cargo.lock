@@ -2812,9 +2812,11 @@ dependencies = [
 name = "iroh-drop-daemon"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "iroh",
  "iroh-drop",
  "iroh-drop-sdk",
+ "postcard",
  "serde",
  "serde_json",
  "tempfile",

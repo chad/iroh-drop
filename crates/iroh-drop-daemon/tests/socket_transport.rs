@@ -247,7 +247,7 @@ async fn drop_outlives_its_publisher() {
             .serve(),
     );
 
-    let c_chad = connect(&sock_chad, Hello::observer("chad"), None)
+    let c_chad = connect(&sock_chad, Hello::control("chad"), None)
         .await
         .expect("connect chad");
     let c_mum = connect(
@@ -310,7 +310,7 @@ async fn drop_outlives_its_publisher() {
             .expect("bind aunt")
             .serve(),
     );
-    let c_aunt = connect(&sock_aunt, Hello::observer("aunt"), None)
+    let c_aunt = connect(&sock_aunt, Hello::control("aunt"), None)
         .await
         .expect("connect aunt");
     c_aunt
@@ -402,7 +402,7 @@ async fn a_departed_ui_does_not_swallow_questions() {
             .serve(),
     );
 
-    let client_a = connect(&sock_send, Hello::observer("sender"), None)
+    let client_a = connect(&sock_send, Hello::control("sender"), None)
         .await
         .expect("sender client");
 
