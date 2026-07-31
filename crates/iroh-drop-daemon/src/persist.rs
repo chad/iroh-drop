@@ -19,14 +19,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::ServiceOptions;
 
+fn default_mine() -> bool {
+    true
+}
+
 /// One hosted drop, as of the last persist.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedDrop {
     /// The daemon-local handle (`d3`), kept stable across restarts so scripts
     /// and UIs do not see drops rename themselves.
     pub handle: String,
-    /// Display name for drops we created; joined drops have none.
+    /// Display name (ours, or the ticket's for a joined drop).
     pub name: Option<String>,
+    /// True when we created the drop. Defaults to true for tables written
+    /// before this field existed — those only ever held created drops.
+    #[serde(default = "default_mine")]
+    pub mine: bool,
     /// Full ticket (bootstrap addresses included, possibly stale — a join
     /// does not need any of them to be reachable).
     pub ticket: String,

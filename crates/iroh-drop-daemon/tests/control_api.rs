@@ -524,3 +524,118 @@ async fn a_restarted_daemon_rejoins_its_drops() {
     Arc::clone(&b2).shutdown().await;
     Arc::clone(&c).shutdown().await;
 }
+
+/// Membership is a set: joining a group you are already in must not
+/// duplicate it, whatever path the same ticket takes to arrive twice.
+#[tokio::test]
+async fn joining_twice_is_the_same_membership() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let a = Service::new(options(tmp.path(), "a")).await.expect("a");
+    let client_a = Client::connect_memory(&a, Hello::control("a"), None)
+        .await
+        .expect("client a");
+    let drop_a = client_a
+        .call("drop.create", json!({"name": "Holiday photos"}))
+        .await
+        .expect("create")["drop"]
+        .clone();
+    let ticket = full_ticket(&client_a, &drop_a).await;
+
+    let b = Service::new(options(tmp.path(), "b")).await.expect("b");
+    let client_b = Client::connect_memory(&b, Hello::control("b"), None)
+        .await
+        .expect("client b");
+    let first = client_b
+        .call("drop.join", json!({"ticket": ticket}))
+        .await
+        .expect("first join");
+    let second = client_b
+        .call("drop.join", json!({"ticket": ticket}))
+        .await
+        .expect("second join");
+    assert_eq!(first["drop"], second["drop"], "same handle both times");
+    assert_eq!(second["already"], json!(true), "second join is a no-op");
+
+    let listed = client_b.call("drop.list", json!({})).await.expect("list");
+    let drops = listed["drops"].as_array().expect("array");
+    assert_eq!(drops.len(), 1, "one membership, not two: {listed}");
+    // ...and the group has its name from the ticket, not "received files".
+    assert_eq!(drops[0]["name"], json!("Holiday photos"));
+    // The daemon says who created it; a name is not proof of ownership.
+    assert_eq!(drops[0]["mine"], json!(false), "a joined group is not mine");
+
+    Arc::clone(&a).shutdown().await;
+    Arc::clone(&b).shutdown().await;
+}
+
+/// The "stay in the group" guarantee: an offer you did not accept — here,
+/// declined because no UI was attached and auto-accept is off — stays
+/// visible in the group and fetchable for as long as you remain a member.
+#[tokio::test]
+async fn a_declined_offer_stays_fetchable() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let payload = tmp.path().join("notes.txt");
+    std::fs::write(&payload, b"offered while you were away\n").expect("write payload");
+
+    let a = Service::new(options(tmp.path(), "a")).await.expect("a");
+    let client_a = Client::connect_memory(&a, Hello::control("a"), None)
+        .await
+        .expect("client a");
+    let drop_a = client_a
+        .call("drop.create", json!({}))
+        .await
+        .expect("create")["drop"]
+        .clone();
+    client_a
+        .call(
+            "offer.publish",
+            json!({"drop": drop_a, "path": payload.to_str().expect("utf8")}),
+        )
+        .await
+        .expect("publish");
+    let ticket = full_ticket(&client_a, &drop_a).await;
+
+    // B joins with no UI and no auto-accept: the offer is declined…
+    let b = Service::new(options(tmp.path(), "b")).await.expect("b");
+    let client_b = Client::connect_memory(&b, Hello::control("b"), None)
+        .await
+        .expect("client b");
+    let drop_b = client_b
+        .call("drop.join", json!({"ticket": ticket}))
+        .await
+        .expect("join")["drop"]
+        .clone();
+    let declined = client_b
+        .wait_for(TIMEOUT, |env| env.e == "offer.declined")
+        .await
+        .expect("offer declined with no one to ask");
+    let hash = declined.p["hash"].as_str().expect("hash").to_string();
+
+    // …but it has not gone anywhere: it is listed, unfetched…
+    let offers = client_b
+        .call("offer.list", json!({"drop": drop_b}))
+        .await
+        .expect("offer.list");
+    let item = offers["items"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|i| i["hash"] == json!(hash))
+        .expect("declined offer still listed");
+    assert_eq!(item["status"], json!("missing"), "not fetched, still there");
+    assert_eq!(item["name"], json!("notes.txt"));
+
+    // …and asking for it later — which *is* the consent — fetches it.
+    client_b
+        .call("offer.fetch", json!({"drop": drop_b, "pick": item["n"].to_string()}))
+        .await
+        .expect("offer.fetch");
+    client_b
+        .wait_for(TIMEOUT, |env| env.e == "fetch.materialized")
+        .await
+        .expect("fetched after the fact");
+    assert!(tmp.path().join("b-downloads/notes.txt").exists());
+
+    Arc::clone(&a).shutdown().await;
+    Arc::clone(&b).shutdown().await;
+}

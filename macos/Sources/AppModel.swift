@@ -37,6 +37,19 @@ struct Incoming: Identifiable {
 }
 
 /// Something we are sharing.
+/// An offer sitting in one of our groups that we have not fetched.
+struct AvailableOffer: Identifiable {
+    /// Hash plus drop: the same file can be offered in two groups.
+    var id: String { "\(drop)/\(hash)" }
+    var drop: String
+    var groupName: String
+    var hash: String
+    /// The listing number offer.fetch expects as `pick`.
+    var pick: String
+    var name: String
+    var size: String
+}
+
 struct SharedDrop: Identifiable {
     var id: String
     var name: String
@@ -100,6 +113,10 @@ final class AppModel: ObservableObject {
     @Published var incoming: [Incoming] = []
     @Published var transfers: [Transfer] = []
     @Published var shared: [SharedDrop] = []
+    /// Files offered in groups we belong to that we have not fetched yet.
+    /// Membership is sticky, so this list is too: an offer stays here —
+    /// fetchable — until it is fetched or we leave the group.
+    @Published var available: [AvailableOffer] = []
 
     private let client = DaemonClient()
     private var helper: Process?
@@ -220,15 +237,64 @@ final class AppModel: ObservableObject {
                 let name = row["name"] as? String
                 return SharedDrop(
                     id: handle,
-                    // A joined drop has no local name; saying "Received" is
-                    // truer than showing a dash next to things you are sending.
+                    // A joined drop inherits its ticket's display name
+                    // ("Holiday photos"); ancient daemons may send none.
                     name: name ?? "Received files",
                     files: (row["files"] as? NSNumber)?.intValue ?? 0,
                     size: row["human_size"] as? String ?? "",
                     peers: (row["peers"] as? NSNumber)?.intValue ?? 0,
-                    mine: name != nil
+                    // The daemon says who created the drop; never inferred
+                    // from the name, which joined drops now carry.
+                    mine: (row["mine"] as? Bool) ?? (name != nil)
                 )
             }
+            self.refreshAvailable()
+        }
+    }
+
+    /// What is on offer in our groups that we do not have yet. This is the
+    /// durable half of "you see anything offered until you leave": a consent
+    /// card that timed out, or an offer that arrived while the window was
+    /// away, is still here with a Get button.
+    private func refreshAvailable() {
+        let drops = shared
+        guard !drops.isEmpty else {
+            available = []
+            return
+        }
+        var collected: [AvailableOffer] = []
+        let group = DispatchGroup()
+        for drop in drops {
+            group.enter()
+            client.call("offer.list", ["drop": drop.id]) { result in
+                defer { group.leave() }
+                guard case .success(let listed) = result,
+                      let items = listed["items"] as? [[String: Any]] else { return }
+                for item in items where (item["status"] as? String) == "missing" {
+                    collected.append(AvailableOffer(
+                        drop: drop.id,
+                        groupName: drop.name,
+                        hash: item["hash"] as? String ?? "",
+                        pick: String((item["n"] as? NSNumber)?.intValue ?? 0),
+                        name: item["name"] as? String ?? "file",
+                        size: item["human_size"] as? String ?? ""
+                    ))
+                }
+            }
+        }
+        group.notify(queue: .main) { [weak self] in
+            self?.available = collected.sorted { $0.name < $1.name }
+        }
+    }
+
+    /// Asking for a file *is* the consent — the same rule as the consent card.
+    func fetch(_ offer: AvailableOffer) {
+        client.call("offer.fetch", ["drop": offer.drop, "pick": offer.pick]) { [weak self] result in
+            guard let self else { return }
+            if case .failure(let error) = result {
+                self.errorMessage = error.localizedDescription
+            }
+            self.refresh()
         }
     }
 

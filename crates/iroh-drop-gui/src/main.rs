@@ -265,6 +265,34 @@ impl eframe::App for App {
                 }
             }
 
+            // ── new in your groups: offered, not yet fetched ─────────────
+            if !snapshot.available.is_empty() {
+                ui.add_space(12.0);
+                ui.heading("New in your groups");
+                ui.label(
+                    egui::RichText::new(
+                        "You are in these groups until you leave them; anything offered stays                          here, ready to fetch.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                for row in &snapshot.available {
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{:?}  \u{2014} {} in {}",
+                            row.name, row.size, row.group
+                        ));
+                        if ui.small_button("Get").clicked() {
+                            self.bridge.send(Cmd::Fetch {
+                                drop: row.drop.clone(),
+                                pick: row.pick.clone(),
+                                name: row.name.clone(),
+                            });
+                        }
+                    });
+                }
+            }
+
             // ── what you are still sharing ────────────────────────────────
             if !snapshot.drops.is_empty() {
                 ui.add_space(12.0);
@@ -283,7 +311,10 @@ impl eframe::App for App {
                             "{}  \u{2014} {} file(s), {} connected",
                             row.name, row.files, row.peers
                         ));
-                        if ui.small_button("Stop").clicked() {
+                        if ui
+                            .small_button(if row.mine { "Stop" } else { "Leave" })
+                            .clicked()
+                        {
                             self.bridge.send(Cmd::Forget(row.handle.clone()));
                         }
                     });
@@ -322,6 +353,7 @@ struct Snapshot {
     incoming: Vec<bridge::Incoming>,
     transfers: Vec<bridge::Transfer>,
     drops: Vec<bridge::DropRow>,
+    available: Vec<bridge::AvailableRow>,
 }
 
 impl From<&UiState> for Snapshot {
@@ -336,6 +368,7 @@ impl From<&UiState> for Snapshot {
             incoming: state.incoming.clone(),
             transfers: state.transfers.clone(),
             drops: state.drops.clone(),
+            available: state.available.clone(),
         }
     }
 }

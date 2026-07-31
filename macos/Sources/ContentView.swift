@@ -38,6 +38,9 @@ struct ContentView: View {
                     DropZone()
                     ReceiveRow()
 
+                    if !model.available.isEmpty {
+                        AvailableSection()
+                    }
                     if !model.sharing.isEmpty {
                         SharingSection()
                     }
@@ -284,6 +287,41 @@ private struct IncomingCard: View {
 
 // MARK: - Lists
 
+/// Offered in your groups, not yet fetched. Membership is sticky, so these
+/// rows are too: they stay, fetchable, until fetched or until you leave.
+private struct AvailableSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader(title: "New in your groups", count: model.available.count)
+            Card {
+                ForEach(Array(model.available.enumerated()), id: \.element.id) { index, offer in
+                    if index > 0 { Divider().padding(.leading, 38) }
+                    HStack(spacing: 10) {
+                        Image(systemName: "tray.and.arrow.down.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.title3)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(offer.name).lineLimit(1).truncationMode(.middle)
+                            Text([offer.size, "in \(offer.groupName)"]
+                                .filter { !$0.isEmpty }
+                                .joined(separator: " · "))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Button("Get") { model.fetch(offer) }
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                }
+            }
+        }
+    }
+}
+
 private struct SharingSection: View {
     @EnvironmentObject private var model: AppModel
 
@@ -306,7 +344,7 @@ private struct SharingSection: View {
                         Spacer(minLength: 6)
                         Button("Link") { model.showLink(for: drop) }
                             .controlSize(.small)
-                        Button("Stop") { model.stopSharing(drop) }
+                        Button(drop.mine ? "Stop" : "Leave") { model.stopSharing(drop) }
                             .controlSize(.small)
                     }
                     .padding(.horizontal, 12)

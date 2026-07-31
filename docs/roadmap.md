@@ -113,6 +113,21 @@ protocol** — with a hard boundary between the protocol and the UX built on it.
   running end to end: publish, replicate, kill everything, restart one side,
   a brand-new peer still finds the drop by name and fetches it. P4 series/TTL
   remains open.
+- **v0.4.z (shipped)**: sticky membership, everywhere. Joining a group is
+  the default and leaving is explicit on every client (`iroh-drop leave`,
+  "Leave" vs "Stop" in both apps). Joining is idempotent by topic — the
+  same link twice is one membership, and a fresher ticket re-seeds
+  discovery *and* the swarm (`DropSession::join_peers`). Groups inherit the
+  ticket's display name; `drop.list` reports `mine` instead of UIs guessing
+  from the name. The big one, pulled forward from the deferred list:
+  **anti-entropy on neighbor-up** — every new neighbor triggers a cooldown-
+  bounded pull from that neighbor, so members that are never online
+  together still converge without a re-publish. Offers a member has not
+  fetched stay listed as `missing` and fetchable (`offer.fetch`) until they
+  leave — surfaced as "New in your groups" in both apps. Two durability
+  holes the live test caught: membership changes now persist immediately
+  (not on the 250 ms debounce), and the daemon handles SIGTERM, so
+  `pkill` no longer loses the last seconds of state.
 - **v0.5**: P3 swarm fetch (spike first); U5 MCP server.
 - **v0.6**: P5/P6 v2 family (private drops, tombstones); U6 TUI. Private
   drops are also what would make `--lan` safe on untrusted networks, and are

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::StreamExt;
-use iroh::{EndpointId, SecretKey};
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use iroh_blobs::api::downloader::DownloadProgressItem;
 use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::api::{Store, TempTag};
@@ -54,6 +54,16 @@ const JOIN_WAIT: Duration = Duration::from_secs(3);
 
 /// Minimum interval between availability replies for the same requested hash.
 const REQUEST_REPLY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How soon after a catch-up from a peer we would pull from that same peer
+/// again. Anti-entropy fires on every neighbor-up, and a flapping connection
+/// must not become a sync loop; an up-to-date pull is one cheap round trip,
+/// so a minute is plenty fresh for files humans are waiting on.
+const ANTI_ENTROPY_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Upper bound on the anti-entropy bookkeeping map. Cleared wholesale when
+/// hit: the worst case of a cleared entry is one extra cheap sync.
+const ANTI_ENTROPY_PEERS_CAP: usize = 512;
 
 /// Capacity of the event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 512;
@@ -235,6 +245,8 @@ pub(crate) struct SessionInner {
     neighbors: AtomicUsize,
     /// Notifies waiters when `neighbors` becomes non-zero.
     neighbor_notify: tokio::sync::Notify,
+    /// Last anti-entropy pull per peer, for the cooldown.
+    synced_from: Mutex<HashMap<EndpointId, Instant>>,
     request_replies: Mutex<HashMap<BlobHash, Instant>>,
     /// Per-peer flood control for inbound messages and answered requests.
     message_limiter: Mutex<PeerRateLimiter>,
@@ -296,6 +308,7 @@ impl DropSession {
             auto_fetch_bytes: AtomicU64::new(0),
             neighbors: AtomicUsize::new(0),
             neighbor_notify: tokio::sync::Notify::new(),
+            synced_from: Mutex::new(HashMap::new()),
             request_replies: Mutex::new(HashMap::new()),
             message_limiter: Mutex::new(PeerRateLimiter::new(limits::MESSAGES)),
             request_limiter: Mutex::new(PeerRateLimiter::new(limits::REQUESTS)),
@@ -384,6 +397,18 @@ impl DropSession {
         let mut peers: Vec<EndpointId> = state.known_peers.iter().copied().collect();
         peers.sort();
         peers
+    }
+
+    /// Pull additional peers into the gossip swarm, e.g. the bootstrap set
+    /// of a fresher ticket for this same drop. Discovery still has to
+    /// resolve them — pair with [`crate::DropStack::add_known_addr`] when
+    /// the addresses are new. Duplicate or stale peers are harmless.
+    pub async fn join_peers(&self, peers: Vec<EndpointId>) -> Result<(), DropError> {
+        self.inner
+            .sender
+            .join_peers(peers)
+            .await
+            .map_err(|e| DropError::Protocol(ProtocolError::Gossip(e.to_string())))
     }
 
     /// Our endpoint identity.
@@ -1280,6 +1305,7 @@ async fn handle_gossip_event(inner: &Arc<SessionInner>, event: GossipEvent) {
             inner.neighbors.fetch_add(1, Ordering::SeqCst);
             inner.neighbor_notify.notify_waiters();
             let _ = inner.events.send(DropEvent::PeerJoined { peer });
+            maybe_sync_from_neighbor(inner, peer);
         }
         GossipEvent::NeighborDown(peer) => {
             let prev = inner.neighbors.load(Ordering::SeqCst);
@@ -1352,6 +1378,33 @@ async fn handle_gossip_event(inner: &Arc<SessionInner>, event: GossipEvent) {
 /// Verify-level message dispatch, shared by the gossip receive path and
 /// catch-up sync replays. `raw` is the original signed frame, retained for
 /// sync serving when it carries an offer or provider announcement.
+/// Anti-entropy: a neighbor that just appeared may hold history we missed
+/// while they were gone (join-time catch-up only covers the ticket's
+/// bootstrap set, only at join). Pull from them; they see the same
+/// neighbor-up and pull from us, so both directions converge. Replay goes
+/// through the standard verify + dedupe path, so an up-to-date pull costs
+/// one round trip and applies nothing.
+fn maybe_sync_from_neighbor(inner: &Arc<SessionInner>, peer: EndpointId) {
+    {
+        let mut recent = inner.synced_from.lock();
+        if recent.len() >= ANTI_ENTROPY_PEERS_CAP {
+            recent.clear();
+        }
+        let now = Instant::now();
+        if let Some(last) = recent.get(&peer) {
+            if now.duration_since(*last) < ANTI_ENTROPY_COOLDOWN {
+                return;
+            }
+        }
+        recent.insert(peer, now);
+    }
+    // Id-only address on purpose: we are already gossiping with this peer,
+    // so discovery has just demonstrated it can resolve them.
+    inner
+        .clone()
+        .spawn_task(crate::sync::sync_catchup(inner.clone(), vec![EndpointAddr::from(peer)]));
+}
+
 pub(crate) async fn handle_message(
     inner: &Arc<SessionInner>,
     author: EndpointId,

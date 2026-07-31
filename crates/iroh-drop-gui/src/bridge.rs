@@ -40,6 +40,16 @@ pub enum Cmd {
     },
     /// Stop hosting a drop.
     Forget(String),
+    /// Fetch an offer sitting in one of our groups. Asking is consent — the
+    /// same rule as answering yes to a live question.
+    Fetch {
+        /// The drop the offer lives in.
+        drop: String,
+        /// The listing number offer.fetch expects.
+        pick: String,
+        /// Display name, for the log line.
+        name: String,
+    },
 }
 
 /// One thing being sent or received.
@@ -96,6 +106,25 @@ pub struct DropRow {
     pub files: u64,
     /// How many peers are connected.
     pub peers: u64,
+    /// True when we created the drop; false for a group we joined.
+    pub mine: bool,
+}
+
+/// A file offered in one of our groups that we have not fetched. Membership
+/// is sticky, so this row is too: it stays, fetchable, until fetched or
+/// until we leave the group.
+#[derive(Clone, Debug)]
+pub struct AvailableRow {
+    /// The drop the offer lives in.
+    pub drop: String,
+    /// The group's display name.
+    pub group: String,
+    /// The listing number offer.fetch expects.
+    pub pick: String,
+    /// Display name, from untrusted offer metadata.
+    pub name: String,
+    /// Human-readable size.
+    pub size: String,
 }
 
 /// Everything the window renders.
@@ -121,6 +150,8 @@ pub struct UiState {
     pub transfers: Vec<Transfer>,
     /// Drops this daemon hosts.
     pub drops: Vec<DropRow>,
+    /// Offered in our groups, not yet fetched.
+    pub available: Vec<AvailableRow>,
     /// Human-readable notes.
     pub log: Vec<String>,
 }
@@ -478,6 +509,18 @@ async fn handle_cmd(
         Cmd::Forget(handle) => {
             let _ = client.call("drop.leave", json!({"drop": handle})).await;
         }
+        Cmd::Fetch { drop, pick, name } => {
+            state
+                .lock()
+                .expect("state")
+                .note(format!("getting {name}"));
+            if let Err(e) = client
+                .call("offer.fetch", json!({"drop": drop, "pick": pick}))
+                .await
+            {
+                state.lock().expect("state").error = Some(e.msg);
+            }
+        }
     }
     refresh_status(client, state).await;
     ctx.request_repaint();
@@ -565,25 +608,54 @@ pub fn extract_ticket(input: &str) -> Option<String> {
 async fn refresh_status(client: &Arc<Client>, state: &Arc<Mutex<UiState>>) {
     let status = client.call("daemon.status", json!({})).await.ok();
     let listed = client.call("drop.list", json!({})).await.ok();
-    let mut state = state.lock().expect("state");
-    if let Some(status) = status {
-        state.lan_only = status["offline"].as_bool().unwrap_or(false);
-        state.download_dir = str_of(&status, "download_dir");
-    }
-    if let Some(listed) = listed {
-        state.drops = listed["drops"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+    // What is on offer in our groups that we do not have yet. The durable
+    // half of "you see anything offered until you leave": a consent card
+    // that timed out is still here with a Get button. The guard ends with
+    // this block — never held across the offer.list round-trips below.
+    let handles: Vec<(String, String)> = {
+        let mut guard = state.lock().expect("state");
+        if let Some(status) = status {
+            guard.lan_only = status["offline"].as_bool().unwrap_or(false);
+            guard.download_dir = str_of(&status, "download_dir");
+        }
+        if let Some(listed) = listed {
+            guard.drops = listed["drops"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|d| DropRow {
+                    handle: str_of(d, "drop"),
+                    name: d["name"].as_str().unwrap_or("files").to_string(),
+                    files: d["offers"].as_u64().unwrap_or(0),
+                    peers: d["peers"].as_u64().unwrap_or(0),
+                    mine: d["mine"].as_bool().unwrap_or(true),
+                })
+                .collect::<Vec<_>>();
+        }
+        guard
+            .drops
             .iter()
-            .map(|d| DropRow {
-                handle: str_of(d, "drop"),
-                name: d["name"].as_str().unwrap_or("files").to_string(),
-                files: d["offers"].as_u64().unwrap_or(0),
-                peers: d["peers"].as_u64().unwrap_or(0),
-            })
-            .collect();
+            .map(|d| (d.handle.clone(), d.name.clone()))
+            .collect()
+    };
+    let mut available = Vec::new();
+    for (handle, group) in handles {
+        if let Ok(listed) = client.call("offer.list", json!({"drop": handle})).await {
+            for item in listed["items"].as_array().cloned().unwrap_or_default() {
+                if item["status"].as_str() == Some("missing") {
+                    available.push(AvailableRow {
+                        drop: handle.clone(),
+                        group: group.clone(),
+                        pick: item["n"].as_u64().unwrap_or(0).to_string(),
+                        name: str_of(&item, "name"),
+                        size: str_of(&item, "human_size"),
+                    });
+                }
+            }
+        }
     }
+    state.lock().expect("state").available = available;
 }
 
 fn apply_event(state: &Arc<Mutex<UiState>>, names: &mut HashMap<String, String>, env: &Envelope) {

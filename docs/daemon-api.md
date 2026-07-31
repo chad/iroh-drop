@@ -105,12 +105,16 @@ with `op = 65535` instead of hanging up.
 The blob store already survives restarts; the drop *memberships* now do too.
 Beside the blob store (`<store>-daemon/`) the daemon keeps, per drop:
 
-- `drops.json` — handle, display name, and the full ticket (bootstrap
-  addresses possibly stale; a join does not need any of them reachable);
+- `drops.json` — handle, display name, `mine` (whether we created it), and
+  the full ticket (bootstrap addresses possibly stale; a join does not need
+  any of them reachable);
 - `frames-<topic>.bin` — the drop's retained, *signed* history.
 
-Writes are debounced (250 ms) on every state-changing event, and a final
-write happens at shutdown; files are `0600`, written temp-then-renamed. On
+Membership-level changes (`drop.create`, `drop.join`, `offer.publish`) are
+persisted immediately — a crash a hundred milliseconds after joining must
+not lose the membership. Chatty session events ride a 250 ms debounce, and
+a final write happens at shutdown (SIGINT *and* SIGTERM); files are `0600`,
+written temp-then-renamed. On
 startup the daemon rejoins every drop in the table, replays the retained
 frames through the same signature verification and state transitions as live
 traffic (without re-running deciders — a restart must not re-ask consent for
@@ -122,6 +126,13 @@ a drop rename itself.
 group, then *deletes* the persisted state — a deliberate leave is forgotten,
 a crash is not.
 
+Membership is a set, not a list of joins: `drop.join` with a ticket whose
+topic is already hosted returns the existing handle (`already: true`),
+re-seeds discovery with the ticket's bootstrap addresses, pulls those peers
+into the swarm, and adopts the ticket's display name if the first join left
+none. A joined drop is named from its ticket, so groups show up as "Holiday
+photos", not as anonymous memberships.
+
 ## Methods
 
 Namespaced `noun.verb`. All parameters and results are JSON objects — never
@@ -132,8 +143,8 @@ bare values — so fields can be added without breaking clients.
 | Method | Params | Result |
 |---|---|---|
 | `drop.create` | `{name?, policy?, lan?}` | `{drop, ticket, topic}` |
-| `drop.join` | `{ticket \| room \| nearby, policy?}` | `{drop, topic}` |
-| `drop.list` | `{}` | `{drops:[{drop,name,topic,peers,offers,lan}]}` |
+| `drop.join` | `{ticket \| room \| nearby, policy?}` | `{drop, topic, already?}` |
+| `drop.list` | `{}` | `{drops:[{drop,name,mine,topic,peers,offers,lan}]}` |
 | `drop.ticket` | `{drop, full?}` | `{ticket, url}` |
 | `drop.leave` | `{drop, forget?}` | `{}` |
 

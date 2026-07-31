@@ -317,21 +317,90 @@ pub async fn join(ticket: String, socket: Option<PathBuf>) -> Result<()> {
         .call("drop.join", json!({"ticket": ticket}))
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!(
-        "Joined as {}. Anything offered will be announced to whatever is watching \
-         \n(the app window, or `iroh-drop watch`).",
-        as_str(&joined, "drop")
-    );
+    if joined["already"].as_bool() == Some(true) {
+        println!(
+            "Already in that group as {} — one membership, however many times you join.",
+            as_str(&joined, "drop")
+        );
+    } else {
+        println!(
+            "Joined as {}. You stay in the group until you leave it (`iroh-drop leave {}`); \
+             \nanything offered shows up in the app, or with `iroh-drop watch`.",
+            as_str(&joined, "drop"),
+            as_str(&joined, "drop")
+        );
+    }
     Ok(())
 }
 
 /// `iroh-drop drops` — what the daemon is hosting.
+/// Leave a drop — the explicit end of membership. Everything before this is
+/// sticky by default: joining once means staying, across restarts, until
+/// `leave` (or `drops --forget`) says otherwise.
+pub async fn leave(drop: String, socket: Option<PathBuf>) -> Result<()> {
+    let client = attach(socket, Hello::control("iroh-drop leave"), None).await?;
+
+    if drop == "all" {
+        let listed = client
+            .call("drop.list", json!({}))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let handles: Vec<String> = listed["drops"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r["drop"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if handles.is_empty() {
+            println!("Nothing to leave.");
+            return Ok(());
+        }
+        for handle in &handles {
+            client
+                .call("drop.leave", json!({"drop": handle}))
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Left {handle}.");
+        }
+        return Ok(());
+    }
+
+    // Say what we are leaving, not just a handle.
+    let listed = client
+        .call("drop.list", json!({}))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let name = listed["drops"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r["drop"].as_str() == Some(drop.as_str()))
+                .and_then(|r| r["name"].as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| "received files".to_string());
+    client
+        .call("drop.leave", json!({"drop": drop}))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("Left {drop} ({name}). The group keeps going without you.");
+    Ok(())
+}
+
 pub async fn drops(
     forget: Option<String>,
     ticket: Option<String>,
     socket: Option<PathBuf>,
 ) -> Result<()> {
-    let client = attach(socket, Hello::observer("iroh-drop drops"), None).await?;
+    // --forget and --ticket mutate (or reveal a capability), so they need
+    // the control role; a plain listing stays an observer.
+    let hello = if forget.is_some() || ticket.is_some() {
+        Hello::control("iroh-drop drops")
+    } else {
+        Hello::observer("iroh-drop drops")
+    };
+    let client = attach(socket, hello, None).await?;
 
     // A ticket from a peer that is still running is the reliable way to bring
     // in latecomers, and it lists that peer first — so this is how a drop
@@ -389,6 +458,7 @@ pub async fn drops(
             d["peers"]
         );
     }
+    println!("\nDrops persist across restarts. Leave one with:  iroh-drop leave <id>");
     Ok(())
 }
 

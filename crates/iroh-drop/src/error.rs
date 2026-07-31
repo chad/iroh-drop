@@ -77,6 +77,9 @@ pub enum ProtocolError {
     #[error("author is over its offer quota")]
     QuotaExceeded,
 
+    #[error("gossip error: {0}")]
+    Gossip(String),
+
     #[error("peer is sending too fast")]
     RateLimited,
 
@@ -168,6 +171,9 @@ pub enum RejectReason {
 
     #[error("author is over its offer quota")]
     QuotaExceeded,
+
+    #[error("gossip error: {0}")]
+    Gossip(String),
 
     #[error("peer is sending too fast")]
     RateLimited,

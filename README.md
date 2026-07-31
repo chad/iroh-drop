@@ -53,6 +53,11 @@ public API. See [`docs/roadmap.md`](docs/roadmap.md).
 * **Catch up** — a late joiner pulls the retained, still-signed offer log
   from any member over the control ALPN, so it sees the drop's contents *by
   name* even for offers made before it arrived.
+* **Stay** — membership is the default and survives restarts: join once and
+  you are in the group until you explicitly leave. Whenever a neighbor
+  appears, both sides pull whatever history the other has that they missed
+  (anti-entropy on neighbor-up), so two machines that are never online at
+  the same time still converge.
 * **Fetch** — manual by default, policy-gated, pulled from any peer that has
   the bytes and verified against the hash.
 * **Replicate** — every successful recipient announces itself as a provider,
@@ -107,7 +112,8 @@ iroh-drop get <ticket>                  # fetches, then keeps serving too
 iroh-drop watch                         # incoming offers, with an accept prompt
 iroh-drop drops                         # what the daemon is hosting
 iroh-drop drops --ticket d1             # a fresh ticket listing you first
-iroh-drop drops --forget d1             # stop hosting
+iroh-drop leave d1                      # leave a group (or stop hosting yours)
+iroh-drop leave all                     # leave everything
 ```
 
 `watch` is the receiving end: nothing is written to disk until you say yes, and
@@ -328,7 +334,7 @@ removal and no private drops yet — see the roadmap.
 ## Development
 
 ```sh
-cargo test --workspace     # 100 tests, 3 #[ignore]d (live mDNS + internet)
+cargo test --workspace     # 103 tests, 3 #[ignore]d (live mDNS + internet)
 cargo test --workspace -- --ignored   # + live mDNS and internet tests
 cargo clippy --workspace --all-targets
 cargo run -p iroh-drop --example four_peer_drop

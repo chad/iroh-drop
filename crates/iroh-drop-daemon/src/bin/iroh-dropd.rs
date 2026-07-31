@@ -85,12 +85,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "iroh-dropd ready"
         );
 
-        // Ctrl-C withdraws politely; anything else is a crash, which the
-        // protocol already tolerates (see tests/publisher_exit.rs).
+        // Ctrl-C and SIGTERM both shut down politely — state is persisted,
+        // but no withdrawal is announced: shutting down is not leaving.
+        // Anything harder is a crash, which the protocol already tolerates
+        // (see tests/publisher_exit.rs).
+        #[cfg(unix)]
+        let sigterm = async {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler")
+                .recv()
+                .await;
+        };
+        #[cfg(not(unix))]
+        let sigterm = std::future::pending::<()>();
         tokio::select! {
             _ = listener.serve() => {}
             _ = tokio::signal::ctrl_c() => {
-                tracing::info!("shutting down");
+                tracing::info!("shutting down (SIGINT)");
+                service.shutdown().await;
+            }
+            _ = sigterm => {
+                tracing::info!("shutting down (SIGTERM)");
                 service.shutdown().await;
             }
         }

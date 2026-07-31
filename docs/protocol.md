@@ -178,6 +178,13 @@ per hash). Retry up to 3 rounds, re-ordering providers each time.
 peers (above) → the inventory arrives with names, sizes and providers intact,
 so the joiner can fetch by name instead of needing a hash out of band.
 
+**Reconnect (anti-entropy).** Join-time sync covers only the ticket's
+bootstrap set and only that moment, so every neighbor-up also triggers a
+pull from that neighbor (per-peer 60 s cooldown; replay is verified and
+deduplicated like any sync). Both sides do this, so two members that were
+never online at the same time still converge on reconnect without any
+re-publish.
+
 **Leave.** Graceful: `Provider(Withdrawing)` for each served blob, then stop.
 Abrupt: nothing — remaining providers cover the drop (see
 `examples/four_peer_drop.rs`).

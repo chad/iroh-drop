@@ -196,6 +196,14 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Leave a drop you joined (or stop hosting one you started).
+    Leave {
+        /// The drop handle from `iroh-drop drops` (like `d2`), or `all`.
+        drop: String,
+        /// Control socket.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// List what the daemon is hosting.
     Drops {
         /// Stop hosting this drop (a handle like `d1`).
@@ -283,6 +291,9 @@ async fn main() -> Result<()> {
             accept_all,
             socket,
         } => daemon_client::watch(accept_all, daemon_client::socket_arg(socket)).await,
+        Command::Leave { drop, socket } => {
+            daemon_client::leave(drop, daemon_client::socket_arg(socket)).await
+        }
         Command::Drops {
             forget,
             ticket,

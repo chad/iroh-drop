@@ -140,6 +140,11 @@ pub fn web_link(base: &str, ticket: &str) -> String {
 struct DropEntry {
     session: Arc<DropSession>,
     name: Option<String>,
+    /// True when we created this drop. Joined drops are served too — that is
+    /// the design — but "yours" vs "a group you are in" are different
+    /// intentions, and the UI is allowed to say so. Never inferred from the
+    /// name: a joined drop inherits its ticket's display name.
+    mine: bool,
 }
 
 struct TaskEntry {
@@ -595,8 +600,10 @@ impl Service {
             })
             .await
             .map_err(ApiError::internal)?;
-        let handle = self.register(session, name);
-        self.schedule_persist(&handle);
+        let handle = self.register(session, name, true);
+        // Membership changes are rare and tiny: persist now, not on the
+        // debounce. A crash 100 ms after creating a drop must not lose it.
+        self.persist_drop(&handle);
         let entry = self.entry(&handle)?;
         Ok(json!({
             "drop": handle,
@@ -613,13 +620,55 @@ impl Service {
         let ticket: DropTicket = ticket
             .parse()
             .map_err(|e| ApiError::bad_params(format!("bad ticket: {e}")))?;
+        // Membership is a set, not a list of joins. Re-joining a group we
+        // are already in (the same link pasted twice, `get` after `join`, a
+        // ticket refreshed since we last saw it) returns the existing drop
+        // instead of duplicating it. The new ticket may carry fresher
+        // bootstrap addresses than the one we joined with, so re-seed.
+        let topic = ticket.topic_id();
+        if let Some(handle) = self.handle_for_topic(&topic) {
+            for addr in ticket.bootstrap_nodes() {
+                self.protocol.stack().add_known_addr(addr.clone());
+            }
+            // Seeding discovery is not enough: pull the fresh bootstrap set
+            // into the swarm itself, or a ticket whose peers are all new
+            // would never actually connect.
+            if let Some(entry) = self.drops.lock().expect("drops").get(&handle) {
+                let session = Arc::clone(&entry.session);
+                let ids: Vec<_> = ticket.bootstrap_nodes().iter().map(|a| a.id).collect();
+                tokio::spawn(async move {
+                    let _ = session.join_peers(ids).await;
+                });
+            }
+            // Adopt the ticket's name if the first join (or a restore of a
+            // pre-names table) left us without one.
+            if let Some(name) = ticket.options().display_name.clone() {
+                let mut drops = self.drops.lock().expect("drops");
+                if let Some(entry) = drops.get_mut(&handle) {
+                    if entry.name.is_none() {
+                        entry.name = Some(name);
+                        drop(drops);
+                        self.persist_drop(&handle);
+                    }
+                }
+            }
+            let entry = self.entry(&handle)?;
+            return Ok(json!({
+                "drop": handle,
+                "topic": entry.session.topic_id().to_string(),
+                "already": true,
+            }));
+        }
+        // A joined drop inherits the ticket's display name, so it shows up
+        // as "Holiday photos" rather than an anonymous membership.
+        let name = ticket.options().display_name.clone();
         let session = self
             .protocol
             .join(ticket)
             .await
             .map_err(ApiError::internal)?;
-        let handle = self.register(session, None);
-        self.schedule_persist(&handle);
+        let handle = self.register(session, name, false);
+        self.persist_drop(&handle);
         let entry = self.entry(&handle)?;
         Ok(json!({
             "drop": handle,
@@ -642,6 +691,7 @@ impl Service {
                 json!({
                     "drop": handle,
                     "name": entry.name,
+                    "mine": entry.mine,
                     "topic": entry.session.topic_id().to_string(),
                     "peers": entry.session.peers().len(),
                     "offers": items.len(),
@@ -751,7 +801,8 @@ impl Service {
                     );
                     // Our own broadcast produces no session event, so the
                     // new frames would otherwise wait for the next trigger.
-                    service.schedule_persist(&persist_handle);
+                    // An offer is a membership-level fact: persist now.
+                    service.persist_drop(&persist_handle);
                     Ok(())
                 }
                 Err(e) => Err(e.to_string()),
@@ -839,6 +890,16 @@ impl Service {
             .ok_or_else(|| ApiError::bad_params("drop is required"))
     }
 
+    /// The handle hosting a topic, if we are already in that group.
+    fn handle_for_topic(&self, topic: &[u8; 32]) -> Option<String> {
+        self.drops
+            .lock()
+            .expect("drops")
+            .iter()
+            .find(|(_, entry)| entry.session.topic_id().as_bytes() == topic)
+            .map(|(handle, _)| handle.clone())
+    }
+
     fn entry(&self, handle: &str) -> Result<DropRef, ApiError> {
         let drops = self.drops.lock().expect("drops");
         let entry = drops
@@ -890,7 +951,7 @@ impl Service {
                     let _ = session.reannounce(&record.offer.blob_hash).await;
                 }
                 let topic = session.topic_id().to_string();
-                self.register_restored(pd.handle.clone(), session, pd.name);
+                self.register_restored(pd.handle.clone(), session, pd.name, pd.mine);
                 topic
             };
             debug!(handle = %pd.handle, %topic, "restore: drop rejoined");
@@ -899,13 +960,20 @@ impl Service {
         self.next_drop.fetch_max(max_handle + 1, Ordering::SeqCst);
     }
 
-    fn register_restored(self: &Arc<Self>, handle: String, session: DropSession, name: Option<String>) {
+    fn register_restored(
+        self: &Arc<Self>,
+        handle: String,
+        session: DropSession,
+        name: Option<String>,
+        mine: bool,
+    ) {
         let session = Arc::new(session);
         self.drops.lock().expect("drops").insert(
             handle.clone(),
             DropEntry {
                 session: Arc::clone(&session),
                 name,
+                mine,
             },
         );
         self.bus.emit(
@@ -965,12 +1033,18 @@ impl Service {
             .map(|(handle, entry)| PersistedDrop {
                 handle: handle.clone(),
                 name: entry.name.clone(),
+                mine: entry.mine,
                 ticket: entry.session.ticket().to_string(),
             })
             .collect()
     }
 
-    fn register(self: &Arc<Self>, session: DropSession, name: Option<String>) -> String {
+    fn register(
+        self: &Arc<Self>,
+        session: DropSession,
+        name: Option<String>,
+        mine: bool,
+    ) -> String {
         let handle = format!("d{}", self.next_drop.fetch_add(1, Ordering::SeqCst));
         let session = Arc::new(session);
         self.drops.lock().expect("drops").insert(
@@ -978,6 +1052,7 @@ impl Service {
             DropEntry {
                 session: Arc::clone(&session),
                 name,
+                mine,
             },
         );
         self.bus.emit(
