@@ -1,6 +1,6 @@
 [package]
 name = "iroh-drop-gui"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Desktop app for iroh-drop: send files to people, and keep serving what you got"

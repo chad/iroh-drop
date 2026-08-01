@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-drop-cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2810,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-drop-daemon"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bytes",
  "iroh",
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-drop-gui"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "egui",
