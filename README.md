@@ -35,8 +35,10 @@ Windows (same daemon underneath):
   <img src="docs/screenshots/windows-window.png" width="560" alt="Drop for Windows — groups and a transfer">
 </p>
 <p align="center">
-  <img src="docs/screenshots/windows-consent.png" width="278" alt="Consent on Windows">
-  <img src="docs/screenshots/windows-share.png" width="278" alt="Share link on Windows">
+  <img src="docs/screenshots/windows-consent.png" width="460" alt="Consent on Windows">
+</p>
+<p align="center">
+  <img src="docs/screenshots/windows-share.png" width="460" alt="Share link and QR on Windows">
 </p>
 
 Ask first, always: nothing lands on your disk uninvited, and anything offered
