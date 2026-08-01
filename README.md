@@ -29,6 +29,12 @@ macOS (Windows below, same daemon underneath):
   <img src="docs/screenshots/macos-share.png" width="278" alt="Share sheet — link and QR code">
 </p>
 
+Windows (v0.1.0 build — the window: send a link, paste one to receive, and see what you're still sharing):
+
+<p align="center">
+  <img src="docs/screenshots/windows-window.png" width="560" alt="Drop for Windows — sending, receiving, and active shares">
+</p>
+
 Ask first, always: nothing lands on your disk uninvited, and anything offered
 while you were away waits in **New in your groups** until you get it — or
 leave the group.
