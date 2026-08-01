@@ -29,7 +29,7 @@ macOS (Windows below, same daemon underneath):
   <img src="docs/screenshots/macos-share.png" width="278" alt="Share sheet — link and QR code">
 </p>
 
-Windows (v0.1.0 build — the window: send a link, paste one to receive, and see what you're still sharing):
+Windows (same daemon underneath):
 
 <p align="center">
   <img src="docs/screenshots/windows-window.png" width="560" alt="Drop for Windows — sending, receiving, and active shares">
