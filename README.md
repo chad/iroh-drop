@@ -17,6 +17,22 @@ iroh-drop receive drop1agxpfees...
 No accounts, no server, no hashes to copy. The ticket is the only string
 anybody has to move, and files are picked by name or by number.
 
+## What it looks like
+
+macOS (Windows below, same daemon underneath):
+
+<p align="center">
+  <img src="docs/screenshots/macos-window.png" width="560" alt="Drop for macOS — sending, receiving, groups">
+</p>
+<p align="center">
+  <img src="docs/screenshots/macos-consent.png" width="278" alt="Consent — someone wants to send you a file">
+  <img src="docs/screenshots/macos-share.png" width="278" alt="Share sheet — link and QR code">
+</p>
+
+Ask first, always: nothing lands on your disk uninvited, and anything offered
+while you were away waits in **New in your groups** until you get it — or
+leave the group.
+
 Underneath it is an **announced-blob meta-protocol** for
 [Iroh](https://iroh.computer): subscribe to a drop, and when any member
 publishes a blob, every member learns it exists and can retrieve it —
