@@ -32,7 +32,11 @@ macOS (Windows below, same daemon underneath):
 Windows (same daemon underneath):
 
 <p align="center">
-  <img src="docs/screenshots/windows-window.png" width="560" alt="Drop for Windows — sending, receiving, and active shares">
+  <img src="docs/screenshots/windows-window.png" width="560" alt="Drop for Windows — groups and a transfer">
+</p>
+<p align="center">
+  <img src="docs/screenshots/windows-consent.png" width="278" alt="Consent on Windows">
+  <img src="docs/screenshots/windows-share.png" width="278" alt="Share link on Windows">
 </p>
 
 Ask first, always: nothing lands on your disk uninvited, and anything offered
