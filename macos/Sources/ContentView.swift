@@ -55,10 +55,13 @@ struct ContentView: View {
                     if !model.sharing.isEmpty {
                         SharingSection()
                     }
+                    if !model.joined.isEmpty {
+                        GroupsSection()
+                    }
                     if !model.transfers.isEmpty {
                         ReceivedSection()
                     }
-                    if model.sharing.isEmpty && model.transfers.isEmpty {
+                    if model.sharing.isEmpty && model.joined.isEmpty && model.transfers.isEmpty {
                         EmptyHint()
                     }
                 }
@@ -381,6 +384,55 @@ private struct SharingSection: View {
                         Button(drop.mine ? "Stop Sharing" : "Leave Group", role: .destructive) {
                             model.stopSharing(drop)
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    private func subtitle(for drop: SharedDrop) -> String {
+        var parts = ["\(drop.files) file\(drop.files == 1 ? "" : "s")"]
+        if !drop.size.isEmpty { parts.append(drop.size) }
+        parts.append(drop.peers > 0
+            ? "\(drop.peers) connected"
+            : "waiting for someone")
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// Groups we belong to and serve from, until we explicitly leave.
+private struct GroupsSection: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionHeader(title: "Groups", count: model.joined.count)
+            Card {
+                ForEach(Array(model.joined.enumerated()), id: \.element.id) { index, drop in
+                    if index > 0 { Divider().padding(.leading, 38) }
+                    HStack(spacing: 10) {
+                        Image(systemName: "person.2.fill")
+                            .foregroundStyle(.secondary)
+                            .font(.title3)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(drop.name).lineLimit(1).truncationMode(.middle)
+                            Text(subtitle(for: drop))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 6)
+                        Button("Link") { model.showLink(for: drop) }
+                            .controlSize(.small)
+                        Button("Leave") { model.stopSharing(drop) }
+                            .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .contextMenu {
+                        Button("Copy Link") { model.copyLink(for: drop) }
+                        Button("Show Link & QR…") { model.showLink(for: drop) }
+                        Divider()
+                        Button("Leave Group", role: .destructive) { model.stopSharing(drop) }
                     }
                 }
             }

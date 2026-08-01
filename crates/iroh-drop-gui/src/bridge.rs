@@ -720,7 +720,7 @@ async fn refresh_status(client: &Arc<Client>, state: &Arc<Mutex<UiState>>) {
     for (handle, group) in handles {
         if let Ok(listed) = client.call("offer.list", json!({"drop": handle})).await {
             for item in listed["items"].as_array().cloned().unwrap_or_default() {
-                if item["status"].as_str() == Some("missing") {
+                if matches!(item["status"].as_str(), Some("missing") | Some("failed")) {
                     available.push(AvailableRow {
                         drop: handle.clone(),
                         group: group.clone(),

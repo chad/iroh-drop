@@ -370,11 +370,16 @@ final class AppModel: ObservableObject {
                 defer { group.leave() }
                 guard case .success(let listed) = result,
                       let items = listed["items"] as? [[String: Any]] else { return }
-                for item in items where (item["status"] as? String) == "missing" {
+                // "missing" was never fetched; "failed" was tried and did
+                // not arrive. Both are fetchable — asking is the consent.
+                for item in items where ["missing", "failed"].contains(item["status"] as? String) {
+                    let itemHash = item["hash"] as? String ?? ""
+                    self.namesByHash[itemHash] = item["name"] as? String ?? "file"
+                    self.sizesByHash[itemHash] = item["human_size"] as? String ?? ""
                     collected.append(AvailableOffer(
                         drop: drop.id,
                         groupName: drop.name,
-                        hash: item["hash"] as? String ?? "",
+                        hash: itemHash,
                         pick: String((item["n"] as? NSNumber)?.intValue ?? 0),
                         name: item["name"] as? String ?? "file",
                         size: item["human_size"] as? String ?? ""
@@ -503,6 +508,10 @@ final class AppModel: ObservableObject {
 
     /// Drops we created, which are the ones a person thinks of as "sharing".
     var sharing: [SharedDrop] { shared.filter(\.mine) }
+
+    /// Groups we joined and have not left. Sticky membership means we serve
+    /// these too — they belong on screen exactly where our own shares are.
+    var joined: [SharedDrop] { shared.filter { !$0.mine } }
 
     /// Active transfers, for the menu bar glance.
     var activeTransfers: [Transfer] { transfers.filter { !$0.finished } }

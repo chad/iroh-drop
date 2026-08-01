@@ -96,7 +96,7 @@ private struct MenuBarContent: View {
                 Divider().padding(.vertical, 8)
             }
 
-            if !model.sharing.isEmpty {
+            if !model.shared.isEmpty {
                 sharingSection
                 Divider().padding(.vertical, 8)
             }
@@ -177,7 +177,7 @@ private struct MenuBarContent: View {
             Text("Sharing")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
-            ForEach(model.sharing) { drop in
+            ForEach(model.shared) { drop in
                 HStack {
                     Text(drop.name).lineLimit(1).truncationMode(.middle)
                     Spacer()

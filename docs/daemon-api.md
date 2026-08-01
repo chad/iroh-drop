@@ -166,6 +166,10 @@ the fragment form (below).
 number the CLI shows, so `pick` accepts `3`, `report.pdf`, or a hash prefix
 without the client reimplementing resolution.
 
+`status` is `missing` (never fetched), `fetching`, `failed` (a fetch was
+tried and did not complete — retryable, so clients show it next to
+`missing`, never as complete), or `available` (the bytes are local).
+
 **Long operations return a `task` immediately and never block the connection.**
 Progress arrives as events. This is the difference between a GUI that shows a
 progress bar and a GUI that hangs.

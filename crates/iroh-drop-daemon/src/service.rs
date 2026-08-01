@@ -1374,6 +1374,25 @@ fn status_str(status: &LocalBlobStatus) -> &'static str {
     match status {
         LocalBlobStatus::Missing => "missing",
         LocalBlobStatus::Fetching { .. } => "fetching",
+        // A failed fetch is not "we have it": clients surface it as
+        // fetchable-again, next to missing.
+        LocalBlobStatus::Failed { .. } => "failed",
         _ => "available",
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn failed_is_not_available() {
+        assert_eq!(super::status_str(&super::LocalBlobStatus::Missing), "missing");
+        assert_eq!(
+            super::status_str(&super::LocalBlobStatus::Failed {
+                retryable: true,
+                message: "x".into(),
+            }),
+            "failed"
+        );
+        assert_eq!(super::status_str(&super::LocalBlobStatus::Complete), "available");
     }
 }
