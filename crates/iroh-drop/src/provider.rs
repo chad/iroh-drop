@@ -5,8 +5,8 @@
 //! deprioritizes recent failures, and the caller continues to the next
 //! provider on failure while preserving session health.
 
+use n0_future::time::Instant;
 use std::collections::HashMap;
-use std::time::Instant;
 
 use iroh::EndpointId;
 
@@ -28,6 +28,9 @@ pub struct ProviderInfo {
     /// blob, in milliseconds since the Unix epoch. Used only to order that
     /// author's own claims (see [`ProviderSet::record`]).
     pub announced_at_ms: u64,
+    /// The frame id of the assertion that set `announced_at_ms`; the
+    /// deterministic tie-break for equal timestamps.
+    pub last_frame_id: [u8; 16],
     /// Whether the provider has withdrawn. Withdrawn entries are kept as
     /// tombstones so a stale relay cannot resurrect them.
     pub withdrawn: bool,
@@ -53,7 +56,7 @@ impl ProviderSet {
 
     /// Mark an explicit availability announcement.
     pub fn mark_announced(&mut self, id: EndpointId) {
-        self.record(id, u64::MAX, false);
+        self.record(id, u64::MAX, [0xFF; 16], false);
     }
 
     /// Apply an assertion from `id` about itself, newest-wins.
@@ -65,17 +68,24 @@ impl ProviderSet {
     /// undoing a `Withdrawing` that came after it.
     ///
     /// Returns whether this assertion changed anything.
-    pub fn record(&mut self, id: EndpointId, announced_at_ms: u64, withdrawn: bool) -> bool {
+    pub fn record(
+        &mut self,
+        id: EndpointId,
+        announced_at_ms: u64,
+        frame_id: [u8; 16],
+        withdrawn: bool,
+    ) -> bool {
         let entry = self.providers.entry(id).or_default();
-        // An assertion older than what we already have is stale. Equal
-        // timestamps are accepted so that peers with coarse clocks (or none)
-        // still converge on the latest state they send.
-        if announced_at_ms < entry.announced_at_ms {
+        // An assertion older than what we already have is stale. Ties are
+        // broken by frame id so that every peer — whatever order its relay
+        // delivered the two assertions in — converges on the same winner.
+        if (announced_at_ms, frame_id) < (entry.announced_at_ms, entry.last_frame_id) {
             return false;
         }
         let changed = entry.withdrawn != withdrawn || !entry.announced;
         entry.announced = true;
         entry.announced_at_ms = announced_at_ms;
+        entry.last_frame_id = frame_id;
         entry.withdrawn = withdrawn;
         if withdrawn && self.original == Some(id) {
             self.original = None;
@@ -107,6 +117,7 @@ impl ProviderSet {
             b.3.cmp(&a.3)
                 .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
         });
         for (id, ..) in ranked
             .into_iter()

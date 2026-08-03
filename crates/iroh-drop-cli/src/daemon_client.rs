@@ -108,7 +108,10 @@ pub async fn send(
         // QR carries the link too, so a phone camera opens the app.
         ui::print_qr(&link);
     }
-    println!("The daemon keeps serving these files. Stop with:\n  iroh-drop drops --forget {}", as_str(&created, "drop"));
+    println!(
+        "The daemon keeps serving these files. Stop with:\n  iroh-drop drops --forget {}",
+        as_str(&created, "drop")
+    );
     Ok(())
 }
 

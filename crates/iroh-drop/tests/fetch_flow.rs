@@ -1,3 +1,10 @@
+//! Fetch flows. The first test is the designated *real-carrier smoke
+//! test*: it proves the whole loop — join via ticket, publish, fetch,
+//! replication — over actual iroh-gossip, the carrier production uses.
+//! Everything else runs on the in-memory carrier (see `common::mem_transport`),
+//! which makes protocol logic fast and deterministic. `catch_up_sync.rs`
+//! covers the sync side of the real carrier.
+
 mod common;
 use bytes::Bytes;
 use common::*;
@@ -72,24 +79,24 @@ async fn two_peers_announce_and_fetch() {
 
 #[tokio::test]
 async fn auto_fetch_flow() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
 
-    let proto_b = protocol(DropPolicy {
-        auto_fetch: true,
-        ..Default::default()
-    })
+    let proto_b = mem_protocol(
+        &bus,
+        DropPolicy {
+            auto_fetch: true,
+            ..Default::default()
+        },
+    )
     .await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
         .unwrap();
+    // Subscribed before anything publishes, so no event races past us.
     let mut events_b = session_b.subscribe();
-    let mut events_a = session_a.subscribe();
-    wait_event(&mut events_a, "A sees B", |ev| {
-        matches!(ev, DropEvent::PeerJoined { .. })
-    })
-    .await;
 
     let payload = vec![42u8; 256 * 1024];
     let published = session_a
@@ -115,9 +122,19 @@ async fn auto_fetch_flow() {
 
 #[tokio::test]
 async fn fetch_unknown_hash_fails_retryably() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    // A short provider timeout keeps the failure snappy; the default ten
+    // seconds per request round is for real networks with slow peers.
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(
+        &bus,
+        DropPolicy {
+            provider_timeout: std::time::Duration::from_millis(200),
+            ..Default::default()
+        },
+    )
+    .await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await

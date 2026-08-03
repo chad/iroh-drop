@@ -36,8 +36,12 @@ async fn transfer_over_sockets() {
     let payload = tmp.path().join("holiday.txt");
     std::fs::write(&payload, b"photos of a dog\n").expect("write payload");
 
-    let a = Service::new(options(tmp.path(), "a")).await.expect("service a");
-    let b = Service::new(options(tmp.path(), "b")).await.expect("service b");
+    let a = Service::new(options(tmp.path(), "a"))
+        .await
+        .expect("service a");
+    let b = Service::new(options(tmp.path(), "b"))
+        .await
+        .expect("service b");
 
     let sock_a = tmp.path().join("a").join("control.sock");
     let sock_b = tmp.path().join("b").join("control.sock");
@@ -91,7 +95,7 @@ async fn transfer_over_sockets() {
     // how this shipped broken the first time.
     let link = ticket["link"].as_str().expect("link");
     assert!(
-        link.starts_with("iroh-drop://receive/drop1"),
+        link.starts_with("iroh-drop://receive/drop2"),
         "not a usable link: {link}"
     );
     assert!(!link.contains('<'), "unsubstituted placeholder in {link}");
@@ -165,7 +169,9 @@ async fn stale_socket_is_reclaimed() {
     // stale by definition.
     std::fs::write(&sock, b"leftover").expect("write stale");
 
-    let service = Service::new(options(tmp.path(), "s")).await.expect("service");
+    let service = Service::new(options(tmp.path(), "s"))
+        .await
+        .expect("service");
     let listener = ControlListener::bind(Arc::clone(&service), &sock)
         .await
         .expect("should reclaim the stale path");
@@ -192,13 +198,17 @@ async fn garbage_line_is_ignored() {
 
     let tmp = tempfile::tempdir().expect("tmp");
     let sock = tmp.path().join("run").join("control.sock");
-    let service = Service::new(options(tmp.path(), "s")).await.expect("service");
+    let service = Service::new(options(tmp.path(), "s"))
+        .await
+        .expect("service");
     let listener = ControlListener::bind(Arc::clone(&service), &sock)
         .await
         .expect("bind");
     tokio::spawn(listener.serve());
 
-    let stream = tokio::net::UnixStream::connect(&sock).await.expect("connect");
+    let stream = tokio::net::UnixStream::connect(&sock)
+        .await
+        .expect("connect");
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
@@ -229,7 +239,9 @@ async fn drop_outlives_its_publisher() {
     std::fs::write(&payload, b"Recipe for scones\n").expect("write payload");
 
     // Chad shares; Mum receives and becomes a provider; Aunt arrives later.
-    let chad = Service::new(options(tmp.path(), "chad")).await.expect("chad");
+    let chad = Service::new(options(tmp.path(), "chad"))
+        .await
+        .expect("chad");
     let mum = Service::new(options(tmp.path(), "mum")).await.expect("mum");
 
     let sock_chad = tmp.path().join("chad-run").join("control.sock");
@@ -302,7 +314,9 @@ async fn drop_outlives_its_publisher() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Aunt has never spoken to Chad and never will.
-    let aunt = Service::new(options(tmp.path(), "aunt")).await.expect("aunt");
+    let aunt = Service::new(options(tmp.path(), "aunt"))
+        .await
+        .expect("aunt");
     let sock_aunt = tmp.path().join("aunt-run").join("control.sock");
     tokio::spawn(
         ControlListener::bind(Arc::clone(&aunt), &sock_aunt)

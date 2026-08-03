@@ -13,10 +13,11 @@
 //! * unknown message kinds never terminate a session,
 //! * all variable-length fields are bounded.
 
+use n0_future::time::SystemTime;
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use iroh::{EndpointId, PublicKey, SecretKey, Signature};
+use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ProtocolError;
@@ -39,9 +40,20 @@ pub const KIND_PROVIDER: u16 = 2;
 /// Body kind for [`RequestV1`].
 pub const KIND_REQUEST: u16 = 3;
 
+/// Frame carrying a namespaced application extension ([`ExtensionV1`]).
+///
+/// Kind numbers are globally assigned by the core spec; applications must
+/// never mint their own. Instead they carry an `ExtensionV1` envelope with
+/// a collision-resistant namespace, so two applications can never collide.
+/// Frames with *unknown* numeric kinds are still verified, retained, and
+/// relayed by stock peers (that is what lets future core kinds deploy),
+/// but they are never delivered to extension subscribers.
+pub const KIND_EXTENSION: u16 = 5;
+
 /// Highest body kind reserved for this specification. Kinds in `1..=999` are
-/// defined here; `1000..=1999` are free for experiments; `2000..` are for
-/// applications and vendors. Unknown kinds must be ignored, never fatal.
+/// defined here or by future core versions; everything application-specific
+/// rides the namespaced [`ExtensionV1`] envelope instead of minting numbers.
+/// Unknown kinds must be ignored, never fatal.
 pub const MAX_CORE_KIND: u16 = 999;
 
 /// Largest encoded body accepted inside an envelope.
@@ -64,7 +76,30 @@ pub const MAX_METADATA_VALUE_LEN: usize = 512;
 
 /// Domain separation prefix for message signatures. Bound to the wire major
 /// version, so a frame from one version can never be replayed as another.
-const SIGN_DOMAIN: &[u8] = b"iroh-drop/v2/message/";
+pub(crate) const SIGN_DOMAIN: &[u8] = b"iroh-drop/v3/message/";
+
+/// The pre-review signing domain (families 1–2 signed without topic
+/// binding). Used only as a diagnostic: when current verification fails we
+/// re-verify against the legacy input so an old frame is reported as
+/// `UnsupportedVersion` instead of a generic signature error. Never used
+/// to accept a frame.
+pub(crate) const LEGACY_SIGN_DOMAIN: &[u8] = b"iroh-drop/v2/message/";
+
+/// Signature domain of sealed (family 4) frames. Declared here so the
+/// public decoder can *diagnose* a sealed frame as `UnsupportedVersion(4)`
+/// — never to accept one.
+pub(crate) const SEALED_SIGN_DOMAIN: &[u8] = b"iroh-drop/v4/message/";
+
+/// The bytes an author actually signs: the domain separator, the drop's
+/// topic (so a frame valid in one drop is cryptographic junk in another),
+/// then the encoded envelope.
+pub(crate) fn signing_input(domain: &[u8], topic: &TopicId, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(domain.len() + 32 + payload.len());
+    bytes.extend_from_slice(domain);
+    bytes.extend_from_slice(topic.as_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
 
 /// A message that has been decoded, verified, and validated.
 #[derive(Clone, Debug)]
@@ -111,6 +146,7 @@ impl BodyEnvelopeV1 {
             MessageBodyV1::Offer(offer) => (KIND_OFFER, postcard::to_allocvec(offer)),
             MessageBodyV1::Provider(provider) => (KIND_PROVIDER, postcard::to_allocvec(provider)),
             MessageBodyV1::Request(request) => (KIND_REQUEST, postcard::to_allocvec(request)),
+            MessageBodyV1::Extension(ext) => (KIND_EXTENSION, postcard::to_allocvec(ext)),
         };
         let payload = payload.map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         Ok(Self { kind, payload })
@@ -126,6 +162,7 @@ impl BodyEnvelopeV1 {
         }
         let body = match self.kind {
             KIND_OFFER => MessageBodyV1::Offer(take(&self.payload, "offer")?),
+            KIND_EXTENSION => MessageBodyV1::Extension(take(&self.payload, "extension")?),
             KIND_PROVIDER => MessageBodyV1::Provider(take(&self.payload, "provider")?),
             KIND_REQUEST => MessageBodyV1::Request(take(&self.payload, "request")?),
             _ => return Ok(None),
@@ -150,6 +187,37 @@ pub enum MessageBodyV1 {
     Provider(ProviderV1),
     /// Ask the group who serves a blob. Never an authorization decision.
     Request(RequestV1),
+    /// A namespaced application extension frame.
+    Extension(ExtensionV1),
+}
+
+/// The namespaced extension envelope (kind [`KIND_EXTENSION`]).
+///
+/// Everything application-specific lives behind `namespace`, so extension
+/// authors never register numbers with anyone:
+///
+/// - `namespace`: 16 bytes identifying the application protocol. Derive it
+///   from something you own — a UUID, the first 16 bytes of a hash of your
+///   protocol's fully-qualified name — and publish it in your spec.
+/// - `local_kind`: your protocol's own message number, meaningful only
+///   inside the namespace.
+/// - `schema_version`: your payload's schema version, so your protocol can
+///   evolve without coordination.
+///
+/// The payload is opaque to `iroh-drop` (still size-capped and signed like
+/// every frame). Peers that do not implement the namespace verify, retain,
+/// and relay the frame, so extensions propagate across a mixed swarm.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionV1 {
+    /// Which application protocol this frame belongs to.
+    pub namespace: [u8; 16],
+    /// The application protocol's own message number.
+    pub local_kind: u32,
+    /// The application protocol's payload schema version.
+    pub schema_version: u16,
+    /// Opaque payload bytes, owned by the application protocol. Bounded to
+    /// [`MAX_BODY_SIZE`].
+    pub payload: Vec<u8>,
 }
 
 /// An offer of immutable content.
@@ -205,15 +273,15 @@ pub struct RequestV1 {
 
 /// The signed wire frame actually put on the gossip topic.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct SignedMessageV1 {
+pub(crate) struct SignedMessageV1 {
     /// ed25519 public key (= endpoint id) of the author.
-    author: [u8; 32],
+    pub(crate) author: [u8; 32],
     /// ed25519 signature over `SIGN_DOMAIN || payload`.
     /// Serialized as a vec because serde does not cover `[u8; 64]`;
     /// the length is validated during decode.
-    signature: Vec<u8>,
+    pub(crate) signature: Vec<u8>,
     /// postcard-encoded [`MessageV1`].
-    payload: Vec<u8>,
+    pub(crate) payload: Vec<u8>,
 }
 
 impl MessageV1 {
@@ -229,7 +297,7 @@ impl MessageV1 {
             version: WIRE_VERSION,
             id: rand::random(),
             sent_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
+                .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
             body,
@@ -239,13 +307,10 @@ impl MessageV1 {
     /// Sign and encode the message for broadcast.
     ///
     /// Returns an error if the encoded frame exceeds [`MAX_MESSAGE_SIZE`].
-    pub fn encode(&self, secret: &SecretKey) -> Result<Vec<u8>, ProtocolError> {
+    pub fn encode(&self, secret: &SecretKey, topic: &TopicId) -> Result<Vec<u8>, ProtocolError> {
         let payload =
             postcard::to_allocvec(self).map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        let mut signing_bytes = Vec::with_capacity(SIGN_DOMAIN.len() + payload.len());
-        signing_bytes.extend_from_slice(SIGN_DOMAIN);
-        signing_bytes.extend_from_slice(&payload);
-        let signature = secret.sign(&signing_bytes);
+        let signature = secret.sign(&signing_input(SIGN_DOMAIN, topic, &payload));
         let frame = SignedMessageV1 {
             author: *secret.public().as_bytes(),
             signature: signature.to_bytes().to_vec(),
@@ -259,13 +324,84 @@ impl MessageV1 {
         Ok(bytes)
     }
 
-    /// Decode, verify, and validate a received gossip payload.
-    pub fn decode(bytes: &[u8]) -> Result<VerifiedMessage, ProtocolError> {
+    /// Decode, verify, and validate a received gossip payload for `topic`.
+    ///
+    /// The signature covers the topic: a frame copied from another drop
+    /// fails verification here. Frames from the pre-review wire (signed
+    /// without topic binding) are reported as `UnsupportedVersion`, never
+    /// accepted.
+    pub fn decode(bytes: &[u8], topic: &TopicId) -> Result<VerifiedMessage, ProtocolError> {
         if bytes.len() > MAX_MESSAGE_SIZE {
             return Err(ProtocolError::MessageTooLarge(bytes.len()));
         }
         let (frame, _rest): (SignedMessageV1, _) = postcard::take_from_bytes(bytes)
             .map_err(|e| ProtocolError::Malformed(format!("frame: {e}")))?;
+        let mut verified = Self::verify_for_topic(frame, topic)?;
+        if verified.message.version != WIRE_VERSION {
+            return Err(ProtocolError::UnsupportedVersion(verified.message.version));
+        }
+        if verified.message.body.payload.len() > MAX_BODY_SIZE {
+            return Err(ProtocolError::MessageTooLarge(
+                verified.message.body.payload.len(),
+            ));
+        }
+        // An unknown kind is not an error: verify, hand it back undecoded, and
+        // let the session decide whether to relay it.
+        let body = verified.message.body.decode()?;
+        if let Some(body) = &body {
+            validate_body(body)?;
+        }
+        verified.body = body;
+        Ok(verified)
+    }
+
+    /// Verify a frame against the public family's topic-bound signature.
+    /// On signature failure, diagnose *why* without ever accepting: a frame
+    /// that verifies under the legacy (pre-review) or sealed domain is
+    /// reported as `UnsupportedVersion` — its true problem — so operators
+    /// see "wrong family" instead of a misleading signature error.
+    pub(crate) fn verify_for_topic(
+        frame: SignedMessageV1,
+        topic: &TopicId,
+    ) -> Result<VerifiedMessage, ProtocolError> {
+        match Self::verify_outer(&frame, SIGN_DOMAIN, topic) {
+            Ok(verified) => Ok(verified),
+            Err(ProtocolError::InvalidSignature) => {
+                if let Some(version) = Self::diagnose_other_family(
+                    &frame,
+                    &[LEGACY_SIGN_DOMAIN, SEALED_SIGN_DOMAIN],
+                    topic,
+                ) {
+                    return Err(ProtocolError::UnsupportedVersion(version));
+                }
+                Err(ProtocolError::InvalidSignature)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// If the frame verifies under any of `domains`, return its declared
+    /// version. Diagnostic only — callers must never accept the frame.
+    pub(crate) fn diagnose_other_family(
+        frame: &SignedMessageV1,
+        domains: &[&[u8]],
+        topic: &TopicId,
+    ) -> Option<u16> {
+        for domain in domains {
+            if *domain == LEGACY_SIGN_DOMAIN {
+                if let Ok(legacy) = Self::verify_legacy(frame) {
+                    return Some(legacy.message.version);
+                }
+            } else if let Ok(verified) = Self::verify_outer(frame, domain, topic) {
+                return Some(verified.message.version);
+            }
+        }
+        None
+    }
+
+    /// Verify against the pre-review signing input (legacy domain, no topic
+    /// binding). Diagnostic only — callers must never accept the result.
+    fn verify_legacy(frame: &SignedMessageV1) -> Result<VerifiedMessage, ProtocolError> {
         if frame.payload.len() > MAX_MESSAGE_SIZE {
             return Err(ProtocolError::MessageTooLarge(frame.payload.len()));
         }
@@ -276,8 +412,8 @@ impl MessageV1 {
             .as_slice()
             .try_into()
             .map_err(|_| ProtocolError::Malformed("signature must be 64 bytes".into()))?;
-        let mut signing_bytes = Vec::with_capacity(SIGN_DOMAIN.len() + frame.payload.len());
-        signing_bytes.extend_from_slice(SIGN_DOMAIN);
+        let mut signing_bytes = Vec::with_capacity(LEGACY_SIGN_DOMAIN.len() + frame.payload.len());
+        signing_bytes.extend_from_slice(LEGACY_SIGN_DOMAIN);
         signing_bytes.extend_from_slice(&frame.payload);
         let signature = Signature::from_bytes(signature_bytes);
         author
@@ -285,28 +421,49 @@ impl MessageV1 {
             .map_err(|_| ProtocolError::InvalidSignature)?;
         let (message, _rest): (MessageV1, _) = postcard::take_from_bytes(&frame.payload)
             .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))?;
-        if message.version != WIRE_VERSION {
-            return Err(ProtocolError::UnsupportedVersion(message.version));
+        Ok(VerifiedMessage {
+            author,
+            message,
+            body: None,
+        })
+    }
+
+    /// Verify a frame's signature against `domain || topic || payload` and
+    /// parse its envelope, without checking the version or decoding the
+    /// body. Shared by the public decoder and the sealed family's decoder
+    /// (`seal.rs`), which performs its own version check after this common
+    /// verification.
+    pub(crate) fn verify_outer(
+        frame: &SignedMessageV1,
+        domain: &[u8],
+        topic: &TopicId,
+    ) -> Result<VerifiedMessage, ProtocolError> {
+        if frame.payload.len() > MAX_MESSAGE_SIZE {
+            return Err(ProtocolError::MessageTooLarge(frame.payload.len()));
         }
-        if message.body.payload.len() > MAX_BODY_SIZE {
-            return Err(ProtocolError::MessageTooLarge(message.body.payload.len()));
-        }
-        // An unknown kind is not an error: verify, hand it back undecoded, and
-        // let the session decide whether to relay it.
-        let body = message.body.decode()?;
-        if let Some(body) = &body {
-            validate_body(body)?;
-        }
+        let author =
+            PublicKey::from_bytes(&frame.author).map_err(|_| ProtocolError::InvalidAuthor)?;
+        let signature_bytes: &[u8; 64] = frame
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ProtocolError::Malformed("signature must be 64 bytes".into()))?;
+        let signature = Signature::from_bytes(signature_bytes);
+        author
+            .verify(&signing_input(domain, topic, &frame.payload), &signature)
+            .map_err(|_| ProtocolError::InvalidSignature)?;
+        let (message, _rest): (MessageV1, _) = postcard::take_from_bytes(&frame.payload)
+            .map_err(|e| ProtocolError::Malformed(format!("envelope: {e}")))?;
         Ok(VerifiedMessage {
             author: EndpointId::from(author),
             message,
-            body,
+            body: None,
         })
     }
 }
 
 /// Validate all bounded fields of a message body.
-fn validate_body(body: &MessageBodyV1) -> Result<(), ProtocolError> {
+pub(crate) fn validate_body(body: &MessageBodyV1) -> Result<(), ProtocolError> {
     match body {
         MessageBodyV1::Offer(offer) => {
             validate_name(&offer.name)?;
@@ -333,6 +490,15 @@ fn validate_body(body: &MessageBodyV1) -> Result<(), ProtocolError> {
             Ok(())
         }
         MessageBodyV1::Provider(_) | MessageBodyV1::Request(_) => Ok(()),
+        MessageBodyV1::Extension(ext) => {
+            // Namespace, local kind, and schema version are the
+            // application protocol's own business; only the size bound is
+            // ours to enforce.
+            if ext.payload.len() > MAX_BODY_SIZE {
+                return Err(ProtocolError::MessageTooLarge(ext.payload.len()));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -423,6 +589,10 @@ mod tests {
         SecretKey::from_bytes(&[seed; 32])
     }
 
+    fn topic() -> TopicId {
+        TopicId::from_bytes([0xAB; 32])
+    }
+
     fn offer(name: &str) -> MessageV1 {
         MessageV1::new(MessageBodyV1::Offer(OfferV1 {
             blob_hash: BlobHash::from_bytes([9u8; 32]),
@@ -437,8 +607,8 @@ mod tests {
     #[test]
     fn roundtrip() {
         let msg = offer("slides.pdf");
-        let bytes = msg.encode(&key(1)).unwrap();
-        let verified = MessageV1::decode(&bytes).unwrap();
+        let bytes = msg.encode(&key(1), &topic()).unwrap();
+        let verified = MessageV1::decode(&bytes, &topic()).unwrap();
         assert_eq!(verified.author, EndpointId::from(key(1).public()));
         assert_eq!(verified.message.version, WIRE_VERSION);
         assert_eq!(verified.message.body.kind, KIND_OFFER);
@@ -455,25 +625,25 @@ mod tests {
     fn rejects_wrong_version() {
         let mut msg = offer("a.txt");
         msg.version = 99;
-        let bytes = msg.encode(&key(1)).unwrap();
-        let err = MessageV1::decode(&bytes).unwrap_err();
+        let bytes = msg.encode(&key(1), &topic()).unwrap();
+        let err = MessageV1::decode(&bytes, &topic()).unwrap_err();
         assert!(matches!(err, ProtocolError::UnsupportedVersion(99)));
     }
 
     #[test]
     fn rejects_forged_signature() {
         let msg = offer("a.txt");
-        let mut bytes = msg.encode(&key(1)).unwrap();
+        let mut bytes = msg.encode(&key(1), &topic()).unwrap();
         // Corrupt one byte inside the payload region.
         let n = bytes.len();
         bytes[n - 2] ^= 0xff;
-        assert!(MessageV1::decode(&bytes).is_err());
+        assert!(MessageV1::decode(&bytes, &topic()).is_err());
     }
 
     #[test]
     fn rejects_oversized() {
         let bytes = vec![0u8; MAX_MESSAGE_SIZE + 1];
-        let err = MessageV1::decode(&bytes).unwrap_err();
+        let err = MessageV1::decode(&bytes, &topic()).unwrap_err();
         assert!(matches!(err, ProtocolError::MessageTooLarge(_)));
     }
 
@@ -483,10 +653,10 @@ mod tests {
             "", "..", ".", ".hidden", "a/b", "a\\b", "a\0b", "trail.", "trail ", "lí\nne",
         ] {
             let msg = offer(bad);
-            let bytes = msg.encode(&key(1)).unwrap();
+            let bytes = msg.encode(&key(1), &topic()).unwrap();
             assert!(
                 matches!(
-                    MessageV1::decode(&bytes),
+                    MessageV1::decode(&bytes, &topic()),
                     Err(ProtocolError::InvalidName(_))
                 ),
                 "expected rejection of {bad:?}"
@@ -506,9 +676,9 @@ mod tests {
         };
         offer_body.size = 1;
         let msg = MessageV1::new(MessageBodyV1::Offer(offer_body));
-        let bytes = msg.encode(&key(1)).unwrap();
+        let bytes = msg.encode(&key(1), &topic()).unwrap();
         assert!(matches!(
-            MessageV1::decode(&bytes),
+            MessageV1::decode(&bytes, &topic()),
             Err(ProtocolError::MetadataLimit(_))
         ));
     }
@@ -521,9 +691,9 @@ mod tests {
             payload: vec![7, 7, 7],
         };
         let msg = MessageV1::with_envelope(envelope);
-        let bytes = msg.encode(&key(1)).unwrap();
+        let bytes = msg.encode(&key(1), &topic()).unwrap();
 
-        let verified = MessageV1::decode(&bytes).expect("unknown kinds are not errors");
+        let verified = MessageV1::decode(&bytes, &topic()).expect("unknown kinds are not errors");
         assert_eq!(verified.author, EndpointId::from(key(1).public()));
         assert_eq!(verified.message.body.kind, 1234);
         assert!(
@@ -533,7 +703,11 @@ mod tests {
         // The frame is intact, so it can be relayed verbatim to peers that do
         // understand kind 1234.
         assert_eq!(
-            MessageV1::decode(&bytes).unwrap().message.body.payload,
+            MessageV1::decode(&bytes, &topic())
+                .unwrap()
+                .message
+                .body
+                .payload,
             vec![7, 7, 7]
         );
     }
@@ -544,11 +718,11 @@ mod tests {
             kind: 4321,
             payload: vec![1],
         });
-        let mut bytes = msg.encode(&key(1)).unwrap();
+        let mut bytes = msg.encode(&key(1), &topic()).unwrap();
         let n = bytes.len();
         bytes[n - 1] ^= 0xff;
         assert!(
-            MessageV1::decode(&bytes).is_err(),
+            MessageV1::decode(&bytes, &topic()).is_err(),
             "extensibility must not become a signature bypass"
         );
     }
@@ -560,8 +734,8 @@ mod tests {
             state: ProviderState::Withdrawing,
             announced_at_ms: Some(1_700_000_000_000),
         }));
-        let bytes = msg.encode(&key(2)).unwrap();
-        let verified = MessageV1::decode(&bytes).unwrap();
+        let bytes = msg.encode(&key(2), &topic()).unwrap();
+        let verified = MessageV1::decode(&bytes, &topic()).unwrap();
         match verified.body {
             Some(MessageBodyV1::Provider(p)) => {
                 assert_eq!(p.announced_at_ms, Some(1_700_000_000_000));
@@ -574,9 +748,9 @@ mod tests {
     #[test]
     fn tolerates_trailing_additive_bytes() {
         let msg = offer("slides.pdf");
-        let mut bytes = msg.encode(&key(1)).unwrap();
+        let mut bytes = msg.encode(&key(1), &topic()).unwrap();
         bytes.extend_from_slice(&[9, 9, 9]);
-        let verified = MessageV1::decode(&bytes).unwrap();
+        let verified = MessageV1::decode(&bytes, &topic()).unwrap();
         assert_eq!(verified.message.version, WIRE_VERSION);
     }
 
@@ -614,7 +788,7 @@ mod tests {
                     .wrapping_add(1442695040888963407);
                 *b = (state >> 33) as u8;
             }
-            let _ = MessageV1::decode(&buf);
+            let _ = MessageV1::decode(&buf, &topic());
         }
     }
 }

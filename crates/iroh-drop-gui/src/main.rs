@@ -29,11 +29,18 @@ fn main() -> eframe::Result<()> {
 
     let mut socket: Option<PathBuf> = None;
     let mut lan_only = false;
+    // A URL-scheme invocation (Drop.exe "iroh-drop://receive/drop1…") or a
+    // link handed over on the command line: any positional arg that carries
+    // a ticket.
+    let mut initial_link: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => socket = args.next().map(PathBuf::from),
             "--lan-only" => lan_only = true,
+            _ if initial_link.is_none() && bridge::extract_ticket(&arg).is_some() => {
+                initial_link = Some(arg)
+            }
             _ => {}
         }
     }
@@ -51,7 +58,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             let bridge = bridge::spawn(cc.egui_ctx.clone(), socket, lan_only);
-            Ok(Box::new(App::new(bridge)))
+            Ok(Box::new(App::new(bridge, initial_link)))
         }),
     )
 }
@@ -68,7 +75,13 @@ struct App {
 }
 
 impl App {
-    fn new(bridge: Bridge) -> Self {
+    fn new(bridge: Bridge, initial_link: Option<String>) -> Self {
+        // Launched with a link (URL-scheme click or CLI arg): join right
+        // away. Joining only makes offers visible — consent still gates
+        // every fetch, same as pasting the link and pressing Receive.
+        if let Some(link) = &initial_link {
+            bridge.send(Cmd::Receive(link.clone()));
+        }
         Self {
             bridge,
             link_input: String::new(),
@@ -162,7 +175,9 @@ impl eframe::App for App {
                             .fill(ui.visuals().extreme_bg_color)
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.label(egui::RichText::new("Someone wants to send you:").strong());
+                                ui.label(
+                                    egui::RichText::new("Someone wants to send you:").strong(),
+                                );
                                 // Quoted: a filename must never be able to look
                                 // like our own text.
                                 ui.label(format!("{:?}   {}", incoming.name, incoming.size));
@@ -284,7 +299,11 @@ impl eframe::App for App {
                                         self.copied_at = Some(Instant::now());
                                     }
                                     if ui
-                                        .button(if self.qr_open { "Hide code" } else { "Show code" })
+                                        .button(if self.qr_open {
+                                            "Hide code"
+                                        } else {
+                                            "Show code"
+                                        })
                                         .clicked()
                                     {
                                         self.qr_open = !self.qr_open;
@@ -414,8 +433,12 @@ impl eframe::App for App {
                                 if ui
                                     .add_enabled(
                                         !pending,
-                                        egui::Button::new(if pending { "Getting…" } else { "Get" })
-                                            .small(),
+                                        egui::Button::new(if pending {
+                                            "Getting…"
+                                        } else {
+                                            "Get"
+                                        })
+                                        .small(),
                                     )
                                     .clicked()
                                 {
@@ -480,9 +503,7 @@ impl eframe::App for App {
                     {
                         ui.add_space(28.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(
-                                egui::RichText::new("Nothing yet").strong(),
-                            );
+                            ui.label(egui::RichText::new("Nothing yet").strong());
                             ui.label(
                                 egui::RichText::new(
                                     "Send something and hand over the link, or paste a link \

@@ -45,8 +45,12 @@ async fn consented_offer_is_fetched() {
     let payload = tmp.path().join("report.pdf");
     std::fs::write(&payload, b"pretend this is a PDF\n").expect("write payload");
 
-    let a = Service::new(options(tmp.path(), "a")).await.expect("service a");
-    let b = Service::new(options(tmp.path(), "b")).await.expect("service b");
+    let a = Service::new(options(tmp.path(), "a"))
+        .await
+        .expect("service a");
+    let b = Service::new(options(tmp.path(), "b"))
+        .await
+        .expect("service b");
 
     let client_a = Client::connect_memory(&a, Hello::ui("test-a"), None)
         .await
@@ -139,8 +143,12 @@ async fn offer_without_a_ui_is_declined() {
     let payload = tmp.path().join("unsolicited.bin");
     std::fs::write(&payload, b"you did not ask for this").expect("write payload");
 
-    let a = Service::new(options(tmp.path(), "a")).await.expect("service a");
-    let b = Service::new(options(tmp.path(), "b")).await.expect("service b");
+    let a = Service::new(options(tmp.path(), "a"))
+        .await
+        .expect("service a");
+    let b = Service::new(options(tmp.path(), "b"))
+        .await
+        .expect("service b");
 
     let client_a = Client::connect_memory(&a, Hello::ui("test-a"), None)
         .await
@@ -199,7 +207,9 @@ async fn offer_without_a_ui_is_declined() {
 #[tokio::test]
 async fn unknown_method_is_survivable() {
     let tmp = tempfile::tempdir().expect("tmp");
-    let service = Service::new(options(tmp.path(), "s")).await.expect("service");
+    let service = Service::new(options(tmp.path(), "s"))
+        .await
+        .expect("service");
     let client = Client::connect_memory(&service, Hello::ui("test"), None)
         .await
         .expect("client");
@@ -232,11 +242,7 @@ async fn a_configured_base_adds_a_web_link() {
     let client = Client::connect_memory(&service, Hello::control("test"), None)
         .await
         .expect("client");
-    let drop = client
-        .call("drop.create", json!({}))
-        .await
-        .expect("create")["drop"]
-        .clone();
+    let drop = client.call("drop.create", json!({})).await.expect("create")["drop"].clone();
     let ticket = client
         .call("drop.ticket", json!({"drop": drop}))
         .await
@@ -247,7 +253,10 @@ async fn a_configured_base_adds_a_web_link() {
     // Fragment, not path or query: browsers never send it to the server, so the
     // page can be a static file that learns nothing.
     assert_eq!(web, format!("https://drop.example/#{bare}"));
-    assert!(ticket["link"].as_str().expect("link").starts_with("iroh-drop://"));
+    assert!(ticket["link"]
+        .as_str()
+        .expect("link")
+        .starts_with("iroh-drop://"));
 
     service.shutdown().await;
 }
@@ -392,7 +401,13 @@ async fn observer_cannot_mutate() {
         .await
         .expect("observer");
 
-    for method in ["drop.create", "drop.join", "offer.publish", "offer.fetch", "task.cancel"] {
+    for method in [
+        "drop.create",
+        "drop.join",
+        "offer.publish",
+        "offer.fetch",
+        "task.cancel",
+    ] {
         let err = observer
             .call(method, json!({}))
             .await
@@ -407,7 +422,10 @@ async fn observer_cannot_mutate() {
     assert_eq!(err.code, "forbidden");
 
     // Reads are fine.
-    observer.call("daemon.status", json!({})).await.expect("status");
+    observer
+        .call("daemon.status", json!({}))
+        .await
+        .expect("status");
     observer.call("drop.list", json!({})).await.expect("list");
 
     // And a control client drives.
@@ -627,7 +645,10 @@ async fn a_declined_offer_stays_fetchable() {
 
     // …and asking for it later — which *is* the consent — fetches it.
     client_b
-        .call("offer.fetch", json!({"drop": drop_b, "pick": item["n"].to_string()}))
+        .call(
+            "offer.fetch",
+            json!({"drop": drop_b, "pick": item["n"].to_string()}),
+        )
         .await
         .expect("offer.fetch");
     client_b

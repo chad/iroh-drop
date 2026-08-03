@@ -10,7 +10,9 @@
 //! is fine, a sustained flood is not.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use n0_future::time::Instant;
 
 use iroh::EndpointId;
 

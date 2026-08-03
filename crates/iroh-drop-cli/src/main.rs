@@ -60,6 +60,10 @@ enum Command {
         /// Everyone on the network can then receive these files.
         #[arg(long)]
         lan: bool,
+        /// Create a private drop: the ticket carries a drop key and every
+        /// frame is sealed. Peers without the key learn nothing.
+        #[arg(long)]
+        private: bool,
         /// Share into a saved room (created and remembered if new).
         #[arg(long)]
         room: Option<String>,
@@ -287,10 +291,9 @@ async fn main() -> Result<()> {
         Command::Join { ticket, socket } => {
             daemon_client::join(ticket, daemon_client::socket_arg(socket)).await
         }
-        Command::Watch {
-            accept_all,
-            socket,
-        } => daemon_client::watch(accept_all, daemon_client::socket_arg(socket)).await,
+        Command::Watch { accept_all, socket } => {
+            daemon_client::watch(accept_all, daemon_client::socket_arg(socket)).await
+        }
         Command::Leave { drop, socket } => {
             daemon_client::leave(drop, daemon_client::socket_arg(socket)).await
         }
@@ -306,9 +309,10 @@ async fn main() -> Result<()> {
             ticket_file,
             qr,
             lan,
+            private,
             room,
             args,
-        } => share(paths, ticket_file, qr, lan, room, args).await,
+        } => share(paths, ticket_file, qr, lan, private, room, args).await,
         Command::Receive {
             ticket,
             what,
@@ -329,11 +333,11 @@ async fn main() -> Result<()> {
             args,
         } => {
             let ticket = resolve_source(ticket, room.clone(), None, &args).await?;
-            let (protocol, session, ctx) = start(&args, Some(ticket)).await?;
+            let (protocol, session, ctx) = start(&args, Some(ticket), false).await?;
             interactive(protocol, session, ctx, save_as, room).await
         }
         Command::New { args } => {
-            let (protocol, session, ctx) = start(&args, None).await?;
+            let (protocol, session, ctx) = start(&args, None, false).await?;
             interactive(protocol, session, ctx, None, None).await
         }
     }
@@ -374,6 +378,7 @@ struct Ctx {
 async fn start(
     args: &CommonArgs,
     ticket: Option<DropTicket>,
+    private: bool,
 ) -> Result<(DropProtocol, DropSession, Ctx)> {
     init_tracing(args.verbose);
     let config = Config::load().context("loading config")?;
@@ -434,6 +439,7 @@ async fn start(
                 .create(CreateOptions {
                     display_name: args.name.clone(),
                     auto_fetch_recommended: args.auto,
+                    private,
                 })
                 .await?
         }
@@ -466,6 +472,7 @@ async fn share(
     ticket_file: Option<PathBuf>,
     qr: bool,
     lan: bool,
+    private: bool,
     room: Option<String>,
     args: CommonArgs,
 ) -> Result<()> {
@@ -475,7 +482,7 @@ async fn share(
         Some(name) => Rooms::load()?.ticket(name).ok(),
         None => None,
     };
-    let (protocol, session, ctx) = start(&args, existing).await?;
+    let (protocol, session, ctx) = start(&args, existing, private).await?;
 
     // Publishing before anyone has joined is fine: offers are retained and
     // handed to late joiners by catch-up sync.
@@ -534,7 +541,7 @@ async fn receive(
 ) -> Result<()> {
     let out_dir = out.unwrap_or_else(|| PathBuf::from("."));
     args.dir = Some(out_dir.clone());
-    let (protocol, session, ctx) = start(&args, Some(ticket)).await?;
+    let (protocol, session, ctx) = start(&args, Some(ticket), false).await?;
 
     let mut events = session.subscribe();
     let printer = tokio::spawn({
@@ -965,7 +972,13 @@ fn persist_ticket(ticket: &DropTicket, store: Option<&Path>, ticket_file: Option
 /// `iroh-drop://receive/<ticket>` link, an `https://host/#<ticket>` link, or any
 /// of those surrounded by chat-app chatter.
 pub(crate) fn ticket_from_text(input: &str) -> Option<&str> {
-    let start = input.find("drop1")?;
+    // Accept both prefixes: `drop2` (current) and `drop1` (pre-hardening,
+    // which the ticket parser will reject with a precise version error).
+    let start = input
+        .find("drop2")
+        .into_iter()
+        .chain(input.find("drop1"))
+        .min()?;
     let end = input[start..]
         .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit()))
         .map_or(input.len(), |offset| start + offset);
@@ -984,11 +997,9 @@ pub(crate) fn read_ticket(arg: &str) -> Result<DropTicket> {
     // Accept a link as readily as a bare ticket, because a link is what people
     // are actually given.
     let text = ticket_from_text(text).unwrap_or(text);
-    text.parse().with_context(|| {
-        "that does not look like an iroh-drop link".to_string()
-    })
+    text.parse()
+        .with_context(|| "that does not look like an iroh-drop link".to_string())
 }
-
 
 fn init_tracing(verbose: bool) {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -1007,7 +1018,7 @@ fn init_tracing(verbose: bool) {
 mod tests {
     use super::ticket_from_text;
 
-    const TICKET: &str = "drop1aimfofis3yfxv6oqyama7hct5hgil7ozmrwh4u7ryd6ihbtadeesuaitapjhbfsnoh";
+    const TICKET: &str = "drop2aimfofis3yfxv6oqyama7hct5hgil7ozmrwh4u7ryd6ihbtadeesuaitapjhbfsnoh";
 
     #[test]
     fn reads_every_shape_a_person_might_paste() {
@@ -1030,6 +1041,7 @@ mod tests {
     fn rejects_near_misses() {
         assert_eq!(ticket_from_text(""), None);
         assert_eq!(ticket_from_text("iroh-drop://receive/"), None);
+        assert_eq!(ticket_from_text("drop2short"), None);
         assert_eq!(ticket_from_text("drop1short"), None);
     }
 }

@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# What this enforces, in one place:
+#   * the wire is frozen (conformance fixtures are byte-exact)
+#   * decoders never panic (fuzz smoke on every PR)
+#   * everything builds and tests on all three desktop OSes plus wasm32
+#   * docs build warning-free and every path they mention exists
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: GUI system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev
+      - run: cargo test --workspace
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Docs build warning-free
+        # The CLI's binary is named `iroh-drop`, which collides with the
+        # `iroh_drop` library in rustdoc output; its docs are trivial.
+        run: cargo doc --workspace --no-deps --exclude iroh-drop-cli
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Every path the docs mention exists
+        run: |
+          grep -ohE 'crates/[a-zA-Z0-9_/.-]+' docs/*.md README.md | sort -u | while read -r p; do
+            [ -e "$p" ] || { echo "doc references missing path: $p"; exit 1; }
+          done
+      - name: Wire format is frozen (byte-exact conformance vectors)
+        run: cargo test -p iroh-drop conformance
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Ensure llvm-ar for wasm C deps
+        run: command -v llvm-ar || sudo apt-get install -y llvm
+      - uses: Swatinem/rust-cache@v2
+      - name: Protocol crate targets wasm
+        run: cargo check -p iroh-drop --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+      - name: Web client crate targets wasm
+        # Its .cargo/config.toml supplies the getrandom cfg.
+        working-directory: crates/iroh-drop-web
+        run: cargo check --target wasm32-unknown-unknown
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Seed corpora from the golden conformance fixtures
+        working-directory: crates/iroh-drop/fuzz
+        run: |
+          mkdir -p corpus/fuzz_message_decode corpus/fuzz_sync_envelopes corpus/fuzz_ticket corpus/fuzz_sealed_decode
+          cp ../tests/fixtures/*.bin corpus/fuzz_message_decode/
+          cp ../tests/fixtures/control_*.bin corpus/fuzz_sync_envelopes/
+          cp ../tests/fixtures/ticket_*.txt corpus/fuzz_ticket/
+          cp ../tests/fixtures/sealed_*.bin corpus/fuzz_sealed_decode/
+      - name: Fuzz every decode surface for 60s
+        working-directory: crates/iroh-drop/fuzz
+        run: |
+          for target in fuzz_message_decode fuzz_sync_envelopes fuzz_ticket fuzz_sealed_decode; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=60
+          done

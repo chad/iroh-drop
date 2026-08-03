@@ -21,9 +21,10 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::endpoint_info::UserData;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::Store;
+#[cfg(not(target_arch = "wasm32"))]
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::BlobsProtocol;
@@ -33,11 +34,13 @@ use iroh_gossip::proto::TopicId;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use tracing::{debug, info, warn};
 
-use crate::error::{DropError, NetworkError, StorageError};
+use crate::error::{DropError, NetworkError, PolicyError, StorageError};
 use crate::message::MAX_MESSAGE_SIZE;
 use crate::policy::{DropPolicy, OfferDecider, PolicyDecider};
+use crate::seal::DropKey;
 use crate::session::{DropSession, SessionRegistry};
 use crate::ticket::{DropTicket, DropTicketOptionsV1};
+use crate::transport::{DropTransport, GossipTransport};
 
 /// How to construct the shared endpoint and blob store.
 #[derive(Clone, Debug, Default)]
@@ -53,6 +56,10 @@ pub struct StackOptions {
     /// Created with owner-only permissions if missing. `None` generates a
     /// fresh identity per process, so the `EndpointId` changes on restart.
     pub identity_path: Option<PathBuf>,
+    /// Endpoint identity as a raw key, for hosts that manage key storage
+    /// themselves (a browser persisting to localStorage, a mobile app using
+    /// a keychain). Takes precedence over [`Self::identity_path`].
+    pub secret_key: Option<SecretKey>,
     /// Announce and resolve endpoint addresses on the local network with
     /// mDNS. This makes peers reachable by id alone on a LAN — including in
     /// [`Self::offline`] mode, where there is no relay or DNS lookup — and
@@ -65,6 +72,7 @@ pub struct StackOptions {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum StoreKeeper {
+    #[cfg(not(target_arch = "wasm32"))]
     Fs(FsStore),
     Mem(MemStore),
     /// The store belongs to the host (see [`DropStack::from_parts`]).
@@ -98,9 +106,10 @@ impl DropStack {
     /// Build the full stack and spawn the protocol router.
     pub async fn new(options: StackOptions) -> Result<Self, DropError> {
         let lookup = MemoryLookup::new();
-        let secret = match &options.identity_path {
-            Some(path) => load_or_create_identity(path)?,
-            None => SecretKey::generate(),
+        let secret = match (&options.secret_key, &options.identity_path) {
+            (Some(key), _) => key.clone(),
+            (None, Some(path)) => load_or_create_identity(path)?,
+            (None, None) => SecretKey::generate(),
         };
         // The mDNS service needs our endpoint id, which we know from the
         // secret key before the endpoint exists.
@@ -155,6 +164,7 @@ impl DropStack {
             .await
             .map_err(|e| DropError::Network(NetworkError::Endpoint(e.to_string())))?;
 
+        #[cfg(not(target_arch = "wasm32"))]
         let (store, keeper) = match &options.store_path {
             Some(path) => {
                 let fs = FsStore::load(path)
@@ -166,6 +176,17 @@ impl DropStack {
                 let mem = MemStore::new();
                 (Store::clone(&mem), StoreKeeper::Mem(mem))
             }
+        };
+        // Browsers have no filesystem; blobs live in memory only.
+        #[cfg(target_arch = "wasm32")]
+        let (store, keeper) = {
+            if options.store_path.is_some() {
+                return Err(DropError::Storage(StorageError::Store(
+                    "filesystem blob store is not supported on wasm32".into(),
+                )));
+            }
+            let mem = MemStore::new();
+            (Store::clone(&mem), StoreKeeper::Mem(mem))
         };
 
         let blobs = BlobsProtocol::new(&store, None);
@@ -389,13 +410,26 @@ pub struct CreateOptions {
     pub display_name: Option<String>,
     /// Whether the ticket recommends automatic fetching to joiners.
     pub auto_fetch_recommended: bool,
+    /// Create a private drop: the ticket carries a fresh drop key and every
+    /// frame is sealed (wire family 3 — see `docs/protocol.md`, "Private
+    /// drops"). Rotation story: rotate = new drop.
+    pub private: bool,
 }
 
 /// Builder for a [`DropProtocol`] service over an existing [`DropStack`].
+/// Builds a session's gossip carrier. Receives the session's stack, the
+/// drop's topic, and the bootstrap peer ids (empty on create).
+pub type TransportFactory = Arc<
+    dyn Fn(Arc<DropStack>, TopicId, Vec<EndpointId>) -> Result<Arc<dyn DropTransport>, DropError>
+        + Send
+        + Sync,
+>;
+
 pub struct DropBuilder {
     stack: Arc<DropStack>,
     policy: DropPolicy,
     decider: Arc<dyn OfferDecider>,
+    transport_factory: Option<TransportFactory>,
 }
 
 impl DropBuilder {
@@ -408,6 +442,7 @@ impl DropBuilder {
             stack,
             policy: DropPolicy::default(),
             decider: Arc::new(PolicyDecider),
+            transport_factory: None,
         }
     }
 
@@ -433,12 +468,27 @@ impl DropBuilder {
         self
     }
 
+    /// Override the gossip carrier for every session this builder starts.
+    ///
+    /// The protocol's semantics — signatures, dedup, retention, limits —
+    /// are carrier-independent; sessions only need what [`DropTransport`]
+    /// promises. Production uses [`GossipTransport`] (the default, no
+    /// factory); tests substitute an in-memory transport, which makes the
+    /// protocol-logic suite fast and deterministic. Note the carrier only
+    /// replaces gossip: blob transfer and catch-up sync still use the
+    /// stack's real endpoint.
+    pub fn transport_factory(mut self, factory: TransportFactory) -> Self {
+        self.transport_factory = Some(factory);
+        self
+    }
+
     /// Finish building the shared protocol service.
     pub async fn build(self) -> Result<DropProtocol, DropError> {
         Ok(DropProtocol {
             stack: self.stack,
             policy: self.policy,
             decider: self.decider,
+            transport_factory: self.transport_factory,
         })
     }
 }
@@ -449,6 +499,7 @@ pub struct DropProtocol {
     stack: Arc<DropStack>,
     policy: DropPolicy,
     decider: Arc<dyn OfferDecider>,
+    transport_factory: Option<TransportFactory>,
 }
 
 impl DropProtocol {
@@ -462,46 +513,74 @@ impl DropProtocol {
         &self.policy
     }
 
+    /// How many live sessions one protocol instance supports. Sessions hold
+    /// retained history, dedup state, and gossip subscriptions; an
+    /// application creating unbounded drops must be refused, not allowed to
+    /// exhaust memory one topic at a time.
+    pub const MAX_SESSIONS: usize = 64;
+
+    /// Refuse a new session when the instance is already at capacity.
+    fn check_session_capacity(&self) -> Result<(), DropError> {
+        let registry = self.stack.session_registry().read();
+        let active = registry
+            .values()
+            .filter(|weak| weak.upgrade().is_some())
+            .count();
+        if active >= Self::MAX_SESSIONS {
+            return Err(DropError::Policy(PolicyError::TooManySessions {
+                active,
+                max: Self::MAX_SESSIONS,
+            }));
+        }
+        Ok(())
+    }
+
     /// Create a new drop: generate a random topic, subscribe, and return a
     /// session with a shareable ticket.
     pub async fn create(&self, options: CreateOptions) -> Result<DropSession, DropError> {
+        self.check_session_capacity()?;
         let topic_id = TopicId::from_bytes(rand::random());
-        let ticket = DropTicket::new(
-            *topic_id.as_bytes(),
-            vec![self.stack.addr()],
-            DropTicketOptionsV1 {
-                auto_fetch_recommended: options.auto_fetch_recommended,
-                display_name: options.display_name,
-            },
-        );
-        let topic = self
-            .stack
-            .gossip
-            .subscribe(topic_id, vec![])
-            .await
-            .map_err(|e| DropError::Network(NetworkError::Gossip(e.to_string())))?;
-        let (sender, receiver) = topic.split();
-        info!(topic = %topic_id.fmt_short(), "drop created");
+        let drop_key = options.private.then(DropKey::generate);
+        let ticket_options = DropTicketOptionsV1 {
+            auto_fetch_recommended: options.auto_fetch_recommended,
+            display_name: options.display_name,
+        };
+        let ticket = match &drop_key {
+            Some(key) => DropTicket::new_private(
+                *topic_id.as_bytes(),
+                vec![self.stack.addr()],
+                ticket_options,
+                key.clone(),
+            ),
+            None => DropTicket::new(
+                *topic_id.as_bytes(),
+                vec![self.stack.addr()],
+                ticket_options,
+            ),
+        };
+        let transport = self.session_transport(topic_id, vec![]).await?;
+        info!(topic = %topic_id.fmt_short(), private = drop_key.is_some(), "drop created");
         Ok(DropSession::new(
             Arc::clone(&self.stack),
             self.policy.clone(),
             Arc::clone(&self.decider),
             topic_id,
             ticket,
-            sender,
-            receiver,
+            transport,
+            drop_key,
         ))
     }
 
-    /// Join an existing drop from a ticket.
-    pub async fn join(&self, ticket: DropTicket) -> Result<DropSession, DropError> {
-        // Seed the address lookup so bootstrap peers are dialable.
-        for addr in ticket.bootstrap_nodes() {
-            self.stack.add_known_addr(addr.clone());
+    /// The carrier for a new session: the transport factory if one was
+    /// installed, otherwise iroh-gossip over the shared endpoint.
+    async fn session_transport(
+        &self,
+        topic_id: TopicId,
+        bootstrap: Vec<iroh::EndpointId>,
+    ) -> Result<Arc<dyn DropTransport>, DropError> {
+        if let Some(factory) = &self.transport_factory {
+            return factory(Arc::clone(&self.stack), topic_id, bootstrap);
         }
-        let topic_id = TopicId::from_bytes(ticket.topic_id());
-        let bootstrap: Vec<iroh::EndpointId> =
-            ticket.bootstrap_nodes().iter().map(|a| a.id).collect();
         let topic = self
             .stack
             .gossip
@@ -509,15 +588,30 @@ impl DropProtocol {
             .await
             .map_err(|e| DropError::Network(NetworkError::Gossip(e.to_string())))?;
         let (sender, receiver) = topic.split();
-        info!(topic = %topic_id.fmt_short(), "drop joined");
+        Ok(Arc::new(GossipTransport::new(sender, receiver)))
+    }
+
+    /// Join an existing drop from a ticket.
+    pub async fn join(&self, ticket: DropTicket) -> Result<DropSession, DropError> {
+        self.check_session_capacity()?;
+        // Seed the address lookup so bootstrap peers are dialable.
+        for addr in ticket.bootstrap_nodes() {
+            self.stack.add_known_addr(addr.clone());
+        }
+        let topic_id = TopicId::from_bytes(ticket.topic_id());
+        let bootstrap: Vec<iroh::EndpointId> =
+            ticket.bootstrap_nodes().iter().map(|a| a.id).collect();
+        let transport = self.session_transport(topic_id, bootstrap).await?;
+        let drop_key = ticket.drop_key();
+        info!(topic = %topic_id.fmt_short(), private = drop_key.is_some(), "drop joined");
         let session = DropSession::new(
             Arc::clone(&self.stack),
             self.policy.clone(),
             Arc::clone(&self.decider),
             topic_id,
             ticket.clone(),
-            sender,
-            receiver,
+            transport,
+            drop_key,
         );
         // Gossip has no history: ask the bootstrap peers for the offers and
         // provider announcements that predate us. Best-effort and bounded;

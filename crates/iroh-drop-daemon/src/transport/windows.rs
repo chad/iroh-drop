@@ -120,12 +120,9 @@ pub async fn connect(
     on_ask: Option<AskHandler>,
 ) -> Result<Client, ApiError> {
     let name = path.to_string_lossy().to_string();
-    let client = ClientOptions::new().open(&name).map_err(|e| {
-        ApiError::new(
-            "no_daemon",
-            format!("cannot reach a daemon at {name}: {e}"),
-        )
-    })?;
+    let client = ClientOptions::new()
+        .open(&name)
+        .map_err(|e| ApiError::new("no_daemon", format!("cannot reach a daemon at {name}: {e}")))?;
     let (reader, writer) = tokio::io::split(client);
     connect_io(reader, writer, hello, on_ask).await
 }

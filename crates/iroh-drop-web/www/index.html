@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iroh-drop — hand files to people with one string</title>
+<meta name="description" content="Share files straight from your device to theirs. No accounts, no servers, nothing uploaded — encrypted end to end and verified by hash.">
+<meta property="og:title" content="iroh-drop">
+<meta property="og:description" content="Hand files to people with one string. No accounts, no server, no hashes to copy.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="https://raw.githubusercontent.com/chad/iroh-drop/main/docs/screenshots/macos-window.png">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav id="nav">
+  <a class="brand" href="#" data-scroll="top">
+    <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><path d="M16 2C16 2 5 15 5 21a11 11 0 0 0 22 0C27 15 16 2 16 2z" fill="currentColor"/></svg>
+    iroh-drop
+  </a>
+  <div class="nav-links">
+    <a href="#how" data-scroll="how">How it works</a>
+    <a href="#protocol" data-scroll="protocol">Protocol</a>
+    <a href="#iroh" data-scroll="iroh">What is iroh?</a>
+    <a href="#download" data-scroll="download">Download</a>
+    <a href="https://github.com/chad/iroh-drop" target="_blank" rel="noopener">GitHub&nbsp;↗</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="hero-copy">
+    <h1>Hand files to people<br>with one string.</h1>
+    <p class="lede">
+      iroh-drop moves files straight from your device to theirs — encrypted end
+      to end, verified by hash. No accounts, no servers, and nothing uploaded
+      on the way. This page is the product: you're running a node right now.
+    </p>
+    <div class="badges">
+      <span>no accounts</span><span>no cloud</span><span>end-to-end encrypted</span><span>hash-verified</span>
+    </div>
+  </div>
+
+  <section id="app" class="card app-card" aria-label="iroh-drop app">
+    <div id="receive-banner" class="receive-banner" hidden>
+      <strong>Someone shared files with you.</strong>
+      <span class="muted">Nothing has been downloaded yet — accepting is up to you.</span>
+    </div>
+
+    <div id="share-view" hidden>
+      <div class="link-box">
+        <label>Your drop link — send it to anyone</label>
+        <div class="link-row">
+          <code id="share-link">…</code>
+          <button id="copy-link" class="btn small">Copy</button>
+        </div>
+        <span class="muted tiny">The ticket lives in the #fragment — it is never sent to any server, including this one.</span>
+      </div>
+
+      <div id="dropzone" tabindex="0" role="button" aria-label="Add files">
+        <strong>Drop files here</strong> or <span class="accent">browse</span>
+        <input type="file" id="file" multiple hidden>
+        <div class="muted tiny">Files stay on this device until a receiver accepts them.</div>
+      </div>
+      <ul id="shared-list" class="file-list"></ul>
+
+      <div class="join-row">
+        <input type="text" id="ticket-input" placeholder="Have a ticket? drop2… or iroh-drop://drop2…" spellcheck="false">
+        <button id="join-btn" class="btn ghost">Join</button>
+      </div>
+    </div>
+
+    <div id="receive-view" hidden>
+      <ul id="offers" class="file-list"></ul>
+      <p class="muted tiny" id="receive-empty">Waiting for offers… the drop syncs its history when you join.</p>
+      <p class="tiny muted">Have the desktop app? <a id="open-in-app" href="#">Open this drop in it →</a><br>
+      Terminal? <code>iroh-drop receive</code> accepts this page's URL as-is.</p>
+      <p class="tiny"><a href="#" id="reset-link">start your own drop instead →</a></p>
+    </div>
+
+    <div class="status-line">
+      <span id="status-dot" class="dot"></span>
+      <span id="status-text" class="muted tiny">starting…</span>
+    </div>
+    <details class="activity">
+      <summary class="muted tiny">activity log</summary>
+      <pre id="log"></pre>
+    </details>
+  </section>
+</header>
+
+<main>
+
+<section id="how" class="section">
+  <h2>How it works</h2>
+  <div class="steps">
+    <div class="step card">
+      <div class="step-n">1</div>
+      <h3>Add files</h3>
+      <p>Your device hashes them (BLAKE3) and announces an <em>offer</em> — a
+      name, a size, a hash. <strong>No bytes leave the machine.</strong> Adding
+      is announcing, not sending.</p>
+    </div>
+    <div class="step card">
+      <div class="step-n">2</div>
+      <h3>Send the string</h3>
+      <p>The link carries a <code>drop2…</code> ticket in its fragment. Whoever
+      has it can find the drop and see what's offered. It's the only thing that
+      travels out of band.</p>
+    </div>
+    <div class="step card">
+      <div class="step-n">3</div>
+      <h3>They accept</h3>
+      <p>Bytes flow device-to-device over an encrypted connection, verified
+      chunk-by-chunk against the hash. Everyone who receives helps serve — the
+      drop outlives the original sender.</p>
+    </div>
+  </div>
+  <p class="callout">Nothing lands uninvited: an offer is an announcement, not
+  a transfer. Consent — a click, or a policy you set — is what moves bytes.</p>
+</section>
+
+<section id="protocol" class="section">
+  <h2>The protocol</h2>
+  <p class="section-lede">iroh-drop is a small coordination protocol composed
+  from three existing layers. It adds exactly one idea: <strong>a drop is a
+  gossip topic where offers are announced and consent gates every
+  transfer.</strong></p>
+
+  <div class="flow card">
+    <div class="flow-node">your device</div>
+    <div class="flow-edge">
+      <span class="flow-label">E2E-encrypted QUIC</span>
+      <span class="flow-line"></span>
+      <span class="flow-relay">n0 relay · ciphertext only</span>
+    </div>
+    <div class="flow-node">their device</div>
+  </div>
+  <p class="muted tiny flow-caption">Desktop-to-desktop the relay only helps
+  punch a direct path, then steps aside. In the browser, QUIC runs over the
+  relay's WebSocket — still end-to-end encrypted between the two endpoints;
+  the relay forwards bytes it cannot read.</p>
+
+  <div class="layers">
+    <div class="layer card">
+      <h3><a href="https://iroh.computer" target="_blank" rel="noopener">iroh</a> — connections</h3>
+      <p>Every node is a keypair; its public key <em>is</em> its address. Any
+      node can dial any other by key, with NAT hole-punching for direct paths
+      and relays as fallback. Connections are authenticated and encrypted
+      end to end.</p>
+    </div>
+    <div class="layer card">
+      <h3>tickets — invitations</h3>
+      <p>A <code>drop2…</code> ticket packs the drop's topic id and bootstrap
+      hints into one base32 string. Possession is membership. There is no
+      account layer to revoke, expire, or leak.</p>
+    </div>
+    <div class="layer card">
+      <h3><a href="https://github.com/n0-computer/iroh-gossip" target="_blank" rel="noopener">iroh-gossip</a> — coordination</h3>
+      <p>The drop is a gossip topic. Offers, requests, provider announcements
+      and withdrawals are small messages that flood through the swarm;
+      anti-entropy sync means a late joiner sees the full history.</p>
+    </div>
+    <div class="layer card">
+      <h3><a href="https://github.com/n0-computer/iroh-blobs" target="_blank" rel="noopener">iroh-blobs</a> — bytes</h3>
+      <p>Files are content-addressed by BLAKE3 hash and streamed with per-chunk
+      verification, so any peer can serve any blob and nobody can feed you
+      tampered bytes. Every member that has a blob re-serves it.</p>
+    </div>
+    <div class="layer card">
+      <h3>consent — policy</h3>
+      <p>The receiver's policy decides what happens to an offer: ask a human
+      (this page's Accept button, the desktop consent card) or auto-accept
+      under limits you choose. The default is to ask.</p>
+    </div>
+    <div class="layer card">
+      <h3>the wire — versioning</h3>
+      <p>Kind-tagged, length-prefixed messages (postcard; public family 3,
+      sealed family 4). Unknown kinds are verified and relayed rather than
+      breaking a frame; applications extend through a namespaced envelope,
+      so the protocol grows without flag days.</p>
+    </div>
+  </div>
+</section>
+
+<section id="iroh" class="section">
+  <h2>What is iroh?</h2>
+  <p class="section-lede"><a href="https://iroh.computer" target="_blank" rel="noopener">iroh</a>
+  is an open-source toolkit by <a href="https://n0.computer" target="_blank" rel="noopener">number 0</a>
+  for direct device-to-device connections: dial any node by its public key and
+  let the library worry about NATs, relays, and encryption. iroh-drop builds on
+  <a href="https://github.com/n0-computer/iroh" target="_blank" rel="noopener">iroh</a>,
+  <a href="https://github.com/n0-computer/iroh-gossip" target="_blank" rel="noopener">iroh-gossip</a>,
+  and <a href="https://github.com/n0-computer/iroh-blobs" target="_blank" rel="noopener">iroh-blobs</a>,
+  all of which compile to WebAssembly — which is how this page can be a real
+  node and not a demo.</p>
+</section>
+
+<section id="download" class="section">
+  <h2>Get iroh-drop</h2>
+  <div class="downloads">
+    <div class="dl card featured">
+      <h3>This page</h3>
+      <p>The zero-install client. Runs in any modern browser as a relay-only,
+      in-memory node — perfect for receiving, handy for sharing smaller
+      files.</p>
+      <span class="btn small disabled">You're using it</span>
+    </div>
+    <div class="dl card">
+      <h3>macOS app</h3>
+      <p>Menubar + window app on Apple Silicon. Long-lived node, on-disk store,
+      consent cards, QR sharing, LAN discovery.</p>
+      <a class="btn small" href="https://github.com/chad/iroh-drop/releases/latest" target="_blank" rel="noopener">Download · GitHub releases ↗</a>
+    </div>
+    <div class="dl card">
+      <h3>Windows app</h3>
+      <p>x64 build with the same daemon underneath — same drops, same tickets,
+      same protocol as everything else on this page.</p>
+      <a class="btn small" href="https://github.com/chad/iroh-drop/releases/latest" target="_blank" rel="noopener">Download · GitHub releases ↗</a>
+    </div>
+    <div class="dl card">
+      <h3>CLI</h3>
+      <p>For scripts, servers, and terminals. Ships in every release, or build
+      from source.</p>
+      <pre class="cli-snippet">iroh-drop share ./slides.pdf ./photos
+iroh-drop receive drop2agxpfees…</pre>
+      <a class="btn small" href="https://github.com/chad/iroh-drop/releases/latest" target="_blank" rel="noopener">Releases ↗</a>
+      <a class="btn small ghost" href="https://github.com/chad/iroh-drop#readme" target="_blank" rel="noopener">Build from source ↗</a>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <p>iroh-drop is open source under
+  <a href="https://github.com/chad/iroh-drop" target="_blank" rel="noopener">MIT / Apache-2.0</a>,
+  built on <a href="https://iroh.computer" target="_blank" rel="noopener">iroh</a>.
+  The desktop apps keep content alive; this tab is a leaf.</p>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

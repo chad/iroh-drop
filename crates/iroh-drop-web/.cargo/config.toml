@@ -1,0 +1,16 @@
+# Applies when cargo/wasm-pack is invoked from this directory.
+#
+# getrandom 0.3 (via rand) refuses to compile for wasm32-unknown-unknown
+# unless its browser backend is selected with this cfg. The matching
+# `wasm_js` *feature* is already enabled by iroh-drop's wasm dependencies.
+#
+# NOTE: on macOS you also need a clang with the wasm backend for `ring`'s C
+# build (Apple clang lacks it):
+#
+#   brew install llvm
+#   export CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang
+#   export AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
+#
+# Linux distro clang includes the wasm backend; no setup needed there.
+[build]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

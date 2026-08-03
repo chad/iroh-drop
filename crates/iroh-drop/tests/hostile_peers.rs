@@ -7,7 +7,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::{protocol, ticket_for, wait_event, TIMEOUT};
+use common::{mem_protocol, ticket_for, wait_event, MemBus, TIMEOUT};
 use iroh_drop::hash::BlobHash;
 use iroh_drop::message::{
     BodyEnvelopeV1, MessageBodyV1, MessageV1, OfferV1, ProviderState, ProviderV1,
@@ -23,18 +23,17 @@ use iroh_drop::{DropEvent, ProtocolWarningKind, RejectReason};
 /// per-author quota does, which is the point of having both.
 #[tokio::test]
 async fn offer_floods_are_contained() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
         .unwrap();
+    // Subscribed before anything is sent; on the in-memory carrier the
+    // neighbor link already exists, so no peer-joined wait is needed.
     let mut events_b = session_b.subscribe();
-    wait_event(&mut events_b, "peer joined", |ev| {
-        matches!(ev, DropEvent::PeerJoined { .. })
-    })
-    .await;
 
     // A floods B with distinct offers as fast as gossip will carry them.
     let flood = 300;
@@ -50,7 +49,10 @@ async fn offer_floods_are_contained() {
             metadata: Default::default(),
         };
         let frame = MessageV1::new(MessageBodyV1::Offer(offer))
-            .encode(&proto_a.stack().endpoint.secret_key().clone())
+            .encode(
+                &proto_a.stack().endpoint.secret_key().clone(),
+                &session_a.topic_id(),
+            )
             .unwrap();
         session_a.inject_raw_message(Bytes::from(frame)).await.ok();
     }
@@ -111,25 +113,27 @@ async fn offer_floods_are_contained() {
 /// session keeps processing real messages afterwards.
 #[tokio::test]
 async fn unknown_kinds_are_ignored_not_fatal() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
         .unwrap();
+    // Subscribed before anything is sent; on the in-memory carrier the
+    // neighbor link already exists, so no peer-joined wait is needed.
     let mut events_b = session_b.subscribe();
-    wait_event(&mut events_b, "peer joined", |ev| {
-        matches!(ev, DropEvent::PeerJoined { .. })
-    })
-    .await;
 
     // A kind from the future, correctly signed.
     let frame = MessageV1::with_envelope(BodyEnvelopeV1 {
         kind: 1234,
         payload: vec![1, 2, 3, 4],
     })
-    .encode(&proto_a.stack().endpoint.secret_key().clone())
+    .encode(
+        &proto_a.stack().endpoint.secret_key().clone(),
+        &session_a.topic_id(),
+    )
     .unwrap();
     session_a
         .inject_raw_message(Bytes::from(frame))
@@ -172,18 +176,17 @@ async fn unknown_kinds_are_ignored_not_fatal() {
 /// provider that has gone away.
 #[tokio::test]
 async fn stale_provider_replays_cannot_resurrect() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
         .unwrap();
+    // Subscribed before anything is sent; on the in-memory carrier the
+    // neighbor link already exists, so no peer-joined wait is needed.
     let mut events_b = session_b.subscribe();
-    wait_event(&mut events_b, "peer joined", |ev| {
-        matches!(ev, DropEvent::PeerJoined { .. })
-    })
-    .await;
 
     let published = session_a
         .publish_bytes("leaving.txt".into(), Bytes::from_static(b"bye"))
@@ -209,7 +212,7 @@ async fn stale_provider_replays_cannot_resurrect() {
         state: ProviderState::Withdrawing,
         announced_at_ms: Some(now + 1_000),
     }))
-    .encode(&secret)
+    .encode(&secret, &session_a.topic_id())
     .unwrap();
     session_a
         .inject_raw_message(Bytes::from(withdraw))
@@ -231,7 +234,7 @@ async fn stale_provider_replays_cannot_resurrect() {
         state: ProviderState::Available,
         announced_at_ms: Some(now),
     }))
-    .encode(&secret)
+    .encode(&secret, &session_a.topic_id())
     .unwrap();
     session_a
         .inject_raw_message(Bytes::from(stale))
@@ -251,7 +254,7 @@ async fn stale_provider_replays_cannot_resurrect() {
         state: ProviderState::Available,
         announced_at_ms: Some(now + 2_000),
     }))
-    .encode(&secret)
+    .encode(&secret, &session_a.topic_id())
     .unwrap();
     session_a
         .inject_raw_message(Bytes::from(fresh))

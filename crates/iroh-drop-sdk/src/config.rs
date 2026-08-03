@@ -94,6 +94,7 @@ impl Config {
             store_path: Some(self.store_path.clone()),
             offline,
             identity_path: Some(self.identity_path.clone()),
+            secret_key: None,
             mdns,
         }
     }
@@ -104,6 +105,7 @@ impl Config {
             store_path: None,
             offline,
             identity_path: None,
+            secret_key: None,
             mdns,
         }
     }

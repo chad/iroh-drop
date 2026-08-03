@@ -17,6 +17,18 @@ Quick start
 The link works across the internet (encrypted relay fallback) and on the
 local network (direct). Nothing is uploaded anywhere.
 
+Opening drop1 links in one click (optional)
+-------------------------------------------
+Run install-url-scheme.ps1 once (right-click -> Run with PowerShell) to
+register the iroh-drop:// scheme for your user account — no admin needed.
+After that, clicking an iroh-drop://receive/... link in chat, mail, or a
+browser opens Drop already joining that drop (accepting files is still
+always your choice). Re-run the script if you move the folder.
+Verify from a terminal:
+    start iroh-drop://receive/<a real drop1 link>
+If Drop is already running, a second window opens and joins — closing it
+does not leave the drop (the helper keeps serving; use Leave explicitly).
+
 Command line (optional)
 -----------------------
 iroh-drop.exe send <file>     share through the helper, prints a link

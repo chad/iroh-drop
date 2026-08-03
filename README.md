@@ -7,10 +7,10 @@ laptop.
 ```sh
 # you
 iroh-drop share ./slides.pdf ./photos
-#   → prints a ticket: drop1agxpfees...
+#   → prints a ticket: drop2agxpfees...
 
 # them
-iroh-drop receive drop1agxpfees...
+iroh-drop receive drop2agxpfees...
 #   → Saved 14 file(s) to .
 ```
 
@@ -212,6 +212,13 @@ the drop, read every offer, and publish into it. It is for networks where you
 would happily read a filename out loud. It is opt-in per share and stops when
 the process exits.
 
+If the filenames (or the fact of the drop itself) should stay private on a
+shared network, use a **private drop** instead: the ticket carries a drop key
+and every frame is sealed, so observers and key-less joiners see only
+relayed ciphertext (see `docs/protocol.md`, "Private drops"). `--lan` with a
+private drop is safe on a hostile coffee-shop network: mDNS exposes endpoint
+addresses, never topics, offers, or names.
+
 Tickets are short by default — they name peers by id and let discovery find
 the addresses (pkarr/DNS online, mDNS on a LAN), which is both smaller and
 immune to changing IPs. Pass `--full-ticket` to embed addresses instead, and
@@ -329,10 +336,11 @@ abruptly; D joins later and still gets the file, served by a replica.
 
 ## Tickets
 
-A ticket (`drop1...`, RFC 4648 base32, lowercase, no padding) is a bearer
-capability carrying the topic id, bootstrap addresses, and optional untrusted
-metadata. Anyone holding it can join, read, and publish. Inspect one with
-`iroh-drop inspect <ticket>`.
+A ticket (`drop2...`, RFC 4648 base32, lowercase, no padding) is a bearer
+capability carrying the topic id, bootstrap addresses, the drop mode, and
+optional untrusted metadata. Anyone holding it can join, read, and publish —
+and a private drop's ticket also carries the key that seals it. Inspect one
+with `iroh-drop inspect <ticket>`.
 
 Practical notes:
 
@@ -397,16 +405,26 @@ mode — the same session logic the CLI uses online.
 
 ## Status
 
-v0.4. `WIRE_VERSION = 2`: message bodies are kind-tagged, so unknown kinds are
-ignored *and relayed* rather than breaking a frame, and the control channel is
-op-tagged with a `Hello` capability exchange. State is bounded everywhere
-(offers, providers, peers, aliases, history) with per-author quotas and
-per-peer rate limits; see `docs/protocol.md` for the table and
-`docs/extending.md` to build on it.
+**Versions, once and for all.** App releases are tagged `v0.x.y` on GitHub
+(what you download). The wire speaks **message families 3 (public) and 4
+(sealed)** — frozen, extended additively under the governance rules in
+[`docs/roadmap.md`](docs/roadmap.md). `v0.2.0` was the one deliberate
+breaking change: families 3/4 replaced wire v2 (topic-bound signatures),
+and `drop2` tickets replaced `drop1` — v0.1.x peers and v0.2.x peers reject
+each other cleanly by version. The roadmap's "phase N" numbers are planning
+milestones, not releases.
 
-Known limitations: no private drops or member removal (a ticket is a bearer
-capability, and `--lan` shares it with the network), no swarm (multi-provider
-parallel) downloads, no long-running daemon, sessions are welded to
-iroh-gossip (no pluggable transport yet), and there are no checked-in
-conformance vectors — all tracked in `docs/roadmap.md`.
-Next steps in [`docs/roadmap.md`](docs/roadmap.md).
+The wire in one paragraph: message bodies are kind-tagged, so unknown kinds
+are ignored *and relayed* rather than breaking a frame; application
+protocols ride a namespaced extension envelope (kind 5), never a minted
+kind number; the control channel is op-tagged with a `Hello` capability
+exchange. State is bounded everywhere (offers, providers, peers, aliases,
+history — by count *and* bytes) with per-author quotas and per-peer rate
+limits; see `docs/protocol.md` for the table and `docs/extending.md` to
+build on it.
+
+Known limitations: no member removal (a ticket is a bearer capability;
+excluding someone means rotating to a new drop), `--lan` shares a ticket
+with the local network, no swarm (multi-provider parallel) downloads yet —
+tracked in `docs/roadmap.md`. Next steps in
+[`docs/roadmap.md`](docs/roadmap.md).

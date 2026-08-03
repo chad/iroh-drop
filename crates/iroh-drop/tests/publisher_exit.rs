@@ -11,21 +11,20 @@ use std::time::Duration;
 async fn publisher_exits_new_peer_fetches_from_replica() {
     // The primary proof of the whole spec: a new peer retrieves a file after
     // the original publisher exits, served by a peer that retained the blob.
-    let proto_a = protocol(DropPolicy::default()).await;
+    // On the in-memory carrier neighbor links form exactly where the
+    // tickets point, and D's request broadcast reaches B the instant it is
+    // sent.
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
     let topic = *session_a.topic_id().as_bytes();
 
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
     let session_b = proto_b
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
         .unwrap();
     let mut events_b = session_b.subscribe();
-    let mut events_a = session_a.subscribe();
-    wait_event(&mut events_a, "A sees B", |ev| {
-        matches!(ev, DropEvent::PeerJoined { .. })
-    })
-    .await;
 
     let payload = b"important data that must survive the publisher".to_vec();
     let published = session_a
@@ -45,7 +44,7 @@ async fn publisher_exits_new_peer_fetches_from_replica() {
     .await;
 
     // Third peer C also joins and fetches before A exits (two replicas).
-    let proto_c = protocol(DropPolicy::default()).await;
+    let proto_c = mem_protocol(&bus, DropPolicy::default()).await;
     let session_c = proto_c
         .join(ticket_for(&session_a, proto_a.stack().addr()))
         .await
@@ -64,7 +63,7 @@ async fn publisher_exits_new_peer_fetches_from_replica() {
 
     // A brand-new peer D joins, bootstrapping from B only, knowing nothing
     // but the topic and the hash it wants.
-    let proto_d = protocol(DropPolicy::default()).await;
+    let proto_d = mem_protocol(&bus, DropPolicy::default()).await;
     let ticket_d = DropTicket::new(topic, vec![proto_b.stack().addr()], Default::default());
     let session_d = proto_d.join(ticket_d).await.unwrap();
 

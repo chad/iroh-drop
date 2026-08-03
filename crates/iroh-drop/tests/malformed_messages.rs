@@ -38,7 +38,7 @@ async fn malformed_and_oversized_messages_do_not_kill_session() {
         state: ProviderState::Available,
         announced_at_ms: None,
     }))
-    .encode(&rogue)
+    .encode(&rogue, &session_a.topic_id())
     .unwrap();
     session_b
         .inject_raw_message(Bytes::from(forged))

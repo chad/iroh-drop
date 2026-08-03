@@ -86,6 +86,14 @@ pub enum ProtocolError {
     #[error("invalid message signature")]
     InvalidSignature,
 
+    #[error("sealed frame does not decrypt (wrong drop key or corrupted)")]
+    Unseal,
+
+    /// A blind relay (sealed ticket without a drop key) attempted to
+    /// publish. Relays retain and forward; they have nothing to say.
+    #[error("cannot publish: this ticket carries no drop key (blind relay)")]
+    NoDropKey,
+
     #[error("invalid author public key")]
     InvalidAuthor,
 
@@ -110,6 +118,9 @@ pub enum PolicyError {
 
     #[error("too many concurrent fetches ({active}, max {max})")]
     ConcurrencyLimit { active: usize, max: usize },
+
+    #[error("too many live drop sessions ({active}, max {max})")]
+    TooManySessions { active: usize, max: usize },
 }
 
 /// Network and transfer failures. These are retryable.

@@ -27,8 +27,7 @@ pub fn show(ui: &mut egui::Ui, data: &str) {
     let scale = (available / total as f32).floor().max(1.0);
     let side = scale * total as f32;
 
-    let (response, painter) =
-        ui.allocate_painter(egui::vec2(side, side), egui::Sense::hover());
+    let (response, painter) = ui.allocate_painter(egui::vec2(side, side), egui::Sense::hover());
     let origin = response.rect.min;
 
     // The quiet zone must be light, so paint the whole field first.
@@ -37,8 +36,8 @@ pub fn show(ui: &mut egui::Ui, data: &str) {
     for y in 0..width {
         for x in 0..width {
             if modules[y * width + x] == qrcode::Color::Dark {
-                let min = origin
-                    + egui::vec2((x + quiet) as f32 * scale, (y + quiet) as f32 * scale);
+                let min =
+                    origin + egui::vec2((x + quiet) as f32 * scale, (y + quiet) as f32 * scale);
                 painter.rect_filled(
                     egui::Rect::from_min_size(min, egui::vec2(scale, scale)),
                     0.0,

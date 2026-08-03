@@ -33,6 +33,7 @@ cp "target/$TARGET/release/iroh-drop-app.exe" "$OUT/Drop.exe"
 cp "target/$TARGET/release/iroh-dropd.exe" "$OUT/iroh-dropd.exe"
 cp "target/$TARGET/release/iroh-drop.exe" "$OUT/iroh-drop.exe"
 cp packaging/windows/README.txt "$OUT/README.txt"
+cp packaging/windows/install-url-scheme.ps1 "$OUT/install-url-scheme.ps1"
 
 (cd dist/windows && zip -qr "../iroh-drop-$VERSION-windows-x64.zip" iroh-drop)
 echo "Zipped $ROOT/dist/iroh-drop-$VERSION-windows-x64.zip"

@@ -24,29 +24,68 @@ manifests with `application/vnd.iroh-drop.collection+json`; an application can
 mark anything similarly and degrade gracefully elsewhere — a peer without the
 convention just sees a blob.
 
-## 3. New message kinds (additive, needs a kind number)
+## 3. Namespaced extension protocols (additive, no registration)
 
-Bodies are `{ kind: u16, payload }`, and unknown kinds are ignored **and
-relayed**, so a new kind propagates through peers that predate it.
+Kind numbers belong to the core spec — applications never mint one. Instead,
+every application protocol rides kind `5`, the `ExtensionV1` envelope:
 
-```rust
-use iroh_drop::message::{BodyEnvelopeV1, MessageV1};
-
-let frame = MessageV1::with_envelope(BodyEnvelopeV1 {
-    kind: 2001,                       // 2000.. is yours
-    payload: postcard::to_allocvec(&MyBody { .. })?,
-})
-.encode(&secret)?;
-session.inject_raw_message(frame.into()).await?;   // today's escape hatch
+```
+ExtensionV1 {
+    namespace: [u8; 16],     // which application protocol this is
+    local_kind: u32,         // your own message number
+    schema_version: u16,     // your payload's schema version
+    payload: Vec<u8>,        // yours entirely; opaque to iroh-drop
+}
 ```
 
-Ranges: `1..=999` core, `1000..=1999` experiments, `2000..` applications.
-Receiving side: watch `DropEvent::ProtocolWarning { warning: UnknownKind { .. } }`
-today; a first-class `on_kind` subscription is the natural next step.
+Pick a namespace that cannot collide: a UUID you generated, or the first 16
+bytes of a hash of your protocol's fully-qualified name (presence uses
+`SHA-256("iroh-drop-presence/v1")[:16]`). Publish it in your spec. Inside it,
+`local_kind` and `schema_version` are entirely yours — evolve without asking
+anyone.
 
-Rules your kind must respect, because the protocol enforces them regardless:
-frames stay under 64 KiB, signatures are checked before your code sees
-anything, and rate limits apply per peer.
+```rust
+// Send: signed, deduped, retained, and relayed like any core frame.
+session.send_extension(namespace, 1 /* your kind */, 1 /* your schema */,
+                       payload_bytes).await?;
+
+// Receive: verified frames only, replaying what sync already pulled.
+let mut rx = session.on_extension(namespace);
+while let Ok(frame) = rx.recv().await {
+    // frame.author is cryptographically attributable;
+    // frame.payload is untrusted — validate before you trust it.
+}
+```
+
+What stock peers do with your frames: verify the signature, bound them
+under the extension budget (256 frames / 4 MiB, spent per session), relay
+them to neighbors, and serve them from retained history to late joiners —
+all without understanding the namespace. Frames with *unknown numeric
+kinds* (future core versions) are likewise verified, retained, and relayed,
+but are never delivered to `on_extension` subscribers — delivery is
+namespace-addressed, so a bare number can never squat on a subscriber.
+
+Rules your protocol must respect, because the protocol enforces them
+regardless: frames stay under the body cap (~63 KiB), signatures are
+checked before your code sees anything, rate limits apply per peer, and
+retention is bounded — so keep frames small and treat delivery as
+at-least-once (`ExtensionFrame::id` is your idempotency key). Your payload
+is never validated by iroh-drop; in a private drop it is sealed like
+everything else, in a public drop it is plaintext.
+
+### The canonical example: `iroh-drop-presence`
+
+`crates/iroh-drop-presence` is a complete, tiny extension — presence
+beacons in `PRESENCE_NAMESPACE` — built using only this public API. Its
+test (`tests/relay.rs`) is the composability proof: three peers in a line,
+the middle one running stock `iroh-drop` with no knowledge of presence, and
+the frame still (a) crosses it, (b) keeps it healthy, and (c) is served
+from that peer's retained history to a fourth peer joining late. If you are
+writing an extension, copy that crate's shape.
+
+(The lower-level `DropSession::inject_raw_message` still exists as a
+hidden test hook for forging *invalid* frames — hostile-input tests need
+to bypass the signing path. It is not an extension mechanism.)
 
 ## 4. New control operations (additive, needs an op number)
 
@@ -75,5 +114,6 @@ an entry in `HelloV1::ops`.
   author's own claims.
 - **Do not** treat a ticket as authentication. It is a bearer capability:
   everyone holding it is a full member.
-- **Do not** add a message kind for something a metadata key would carry.
-  Kinds are forever; metadata is cheap.
+- **Do not** mint a numeric kind for anything, ever — use the extension
+  envelope. And do not add an extension namespace for something a metadata
+  key would carry: protocols are forever; metadata is cheap.

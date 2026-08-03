@@ -1,0 +1,41 @@
+[package]
+name = "iroh-drop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: nested inside a workspace member, and built on
+# nightly with sanitizers — never part of the main build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+postcard = "1"
+iroh-drop = { path = ".." }
+
+[[bin]]
+name = "fuzz_message_decode"
+path = "fuzz_targets/fuzz_message_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_ticket"
+path = "fuzz_targets/fuzz_ticket.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sync_envelopes"
+path = "fuzz_targets/fuzz_sync_envelopes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_sealed_decode"
+path = "fuzz_targets/fuzz_sealed_decode.rs"
+test = false
+doc = false

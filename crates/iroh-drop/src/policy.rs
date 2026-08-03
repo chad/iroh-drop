@@ -25,6 +25,11 @@ pub struct DropPolicy {
     pub accepted_media_types: Option<HashSet<String>>,
     /// Directory fetched blobs are exported to.
     pub output_directory: PathBuf,
+    /// How long one request round waits for provider announcements before
+    /// giving up on a fetch nobody has answered. Defaults to
+    /// [`crate::session::DEFAULT_PROVIDER_TIMEOUT`]; shorten it when a
+    /// snappy "nobody has this" beats giving stragglers time to speak up.
+    pub provider_timeout: std::time::Duration,
 }
 
 impl Default for DropPolicy {
@@ -36,6 +41,7 @@ impl Default for DropPolicy {
             max_total_auto_fetch_bytes: 2 * 1024 * 1024 * 1024,
             accepted_media_types: None,
             output_directory: PathBuf::from("./downloads"),
+            provider_timeout: crate::session::DEFAULT_PROVIDER_TIMEOUT,
         }
     }
 }

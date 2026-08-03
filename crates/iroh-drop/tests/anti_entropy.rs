@@ -9,7 +9,7 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{protocol, TIMEOUT};
+use common::{mem_protocol, ticket_for, MemBus, TIMEOUT};
 use iroh::EndpointAddr;
 use iroh_drop::policy::DropPolicy;
 use iroh_drop::DropTicket;
@@ -21,7 +21,8 @@ use iroh_drop::DropTicket;
 /// anything.
 #[tokio::test]
 async fn a_new_neighbor_brings_the_history_we_missed() {
-    let proto_a = protocol(DropPolicy::default()).await;
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
     let session_a = proto_a.create(Default::default()).await.unwrap();
     let published = session_a
         .publish_bytes("one.txt".into(), Bytes::from_static(b"first"))
@@ -35,7 +36,7 @@ async fn a_new_neighbor_brings_the_history_we_missed() {
         vec![dead],
         Default::default(),
     );
-    let proto_b = protocol(DropPolicy::default()).await;
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
     let session_b = proto_b.join(stale_ticket).await.unwrap();
 
     // Prove the premise: no neighbor, nothing learned.
@@ -45,9 +46,8 @@ async fn a_new_neighbor_brings_the_history_we_missed() {
         "join-time catch-up should have found nothing through a dead bootstrap"
     );
 
-    // The daemon's re-join path: seed discovery, then pull the peer into
-    // the swarm. Gossip connects, both sides see a neighbor…
-    proto_b.stack().add_known_addr(proto_a.stack().addr());
+    // The daemon's re-join path: pull the peer into the swarm. Both sides
+    // see a neighbor…
     session_b
         .join_peers(vec![proto_a.stack().addr().id])
         .await
@@ -56,7 +56,11 @@ async fn a_new_neighbor_brings_the_history_we_missed() {
     // …and that alone must be enough for B to learn what A published.
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     loop {
-        if let Some(record) = session_b.offers().into_iter().find(|o| o.offer.name == "one.txt") {
+        if let Some(record) = session_b
+            .offers()
+            .into_iter()
+            .find(|o| o.offer.name == "one.txt")
+        {
             assert_eq!(record.offer.blob_hash, published.hash);
             break;
         }
@@ -69,4 +73,48 @@ async fn a_new_neighbor_brings_the_history_we_missed() {
 
     session_b.shutdown_no_announce().await;
     session_a.shutdown_no_announce().await;
+}
+
+/// Reordering injection: frames held at the bus and released in reverse
+/// order still converge to the same inventory — independent offers carry
+/// no ordering assumptions.
+#[tokio::test]
+async fn reordered_frames_converge() {
+    let bus = MemBus::new();
+    let proto_a = mem_protocol(&bus, DropPolicy::default()).await;
+    let session_a = proto_a.create(Default::default()).await.unwrap();
+
+    let proto_b = mem_protocol(&bus, DropPolicy::default()).await;
+    let session_b = proto_b
+        .join(ticket_for(&session_a, proto_a.stack().addr()))
+        .await
+        .unwrap();
+
+    // A's next two broadcasts are queued at the carrier, then delivered
+    // second-first.
+    bus.hold(session_a.topic_id(), session_a.self_id());
+    let first = session_a
+        .publish_bytes("first.txt".into(), Bytes::from_static(b"one"))
+        .await
+        .unwrap();
+    let second = session_a
+        .publish_bytes("second.txt".into(), Bytes::from_static(b"two"))
+        .await
+        .unwrap();
+    bus.release_reversed(session_a.topic_id(), session_a.self_id());
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let offers = session_b.offers();
+        let have_first = offers.iter().any(|o| o.offer.blob_hash == first.hash);
+        let have_second = offers.iter().any(|o| o.offer.blob_hash == second.hash);
+        if have_first && have_second {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reordered frames never converged (first: {have_first}, second: {have_second})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

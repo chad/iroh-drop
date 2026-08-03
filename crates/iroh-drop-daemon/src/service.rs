@@ -247,12 +247,19 @@ impl AskRouter {
     }
 
     fn forget_closed(&self) {
-        self.uis.lock().expect("uis").retain(|(_, tx)| !tx.is_closed());
+        self.uis
+            .lock()
+            .expect("uis")
+            .retain(|(_, tx)| !tx.is_closed());
     }
 
     /// Is there a UI we could actually ask right now?
     fn has_live_ui(&self) -> bool {
-        self.uis.lock().expect("uis").iter().any(|(_, tx)| !tx.is_closed())
+        self.uis
+            .lock()
+            .expect("uis")
+            .iter()
+            .any(|(_, tx)| !tx.is_closed())
     }
 
     fn answer(&self, id: u64, result: Result<Value, ApiError>) {
@@ -276,7 +283,10 @@ impl AskRouter {
         // rather than competing with whatever came before.
         let target = {
             let uis = self.uis.lock().expect("uis");
-            uis.iter().rev().find(|(_, tx)| !tx.is_closed()).map(|(_, tx)| tx.clone())
+            uis.iter()
+                .rev()
+                .find(|(_, tx)| !tx.is_closed())
+                .map(|(_, tx)| tx.clone())
         };
         let target = match target {
             Some(t) => t,
@@ -346,6 +356,7 @@ impl Service {
         let protocol = DropBuilder::from_options(StackOptions {
             store_path: options.store_path.clone(),
             identity_path: options.identity_path.clone(),
+            secret_key: None,
             offline: options.offline,
             mdns: options.mdns,
         })
@@ -550,9 +561,7 @@ impl Service {
                     "{method} requires the control role"
                 )));
             }
-            "drop.ticket"
-                if !roles.iter().any(|r| matches!(r, Role::Ui | Role::Control)) =>
-            {
+            "drop.ticket" if !roles.iter().any(|r| matches!(r, Role::Ui | Role::Control)) => {
                 return Err(ApiError::forbidden(
                     "drop.ticket reveals the bearer capability; ui or control role required",
                 ));
@@ -591,12 +600,19 @@ impl Service {
     }
 
     async fn drop_create(self: &Arc<Self>, params: Value) -> ApiResult {
-        let name = params.get("name").and_then(Value::as_str).map(str::to_string);
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let session = self
             .protocol
             .create(iroh_drop::CreateOptions {
                 display_name: name.clone(),
                 auto_fetch_recommended: false,
+                private: params
+                    .get("private")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
             .await
             .map_err(ApiError::internal)?;
@@ -707,10 +723,7 @@ impl Service {
 
     fn drop_ticket(&self, params: Value) -> ApiResult {
         let entry = self.entry(self.handle_param(&params)?)?;
-        let full = params
-            .get("full")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let full = params.get("full").and_then(Value::as_bool).unwrap_or(false);
         let ticket = if full {
             entry.session.ticket()
         } else {
@@ -779,35 +792,40 @@ impl Service {
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_params("path is required"))?
             .to_string();
-        let name = params.get("name").and_then(Value::as_str).map(str::to_string);
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let session = Arc::clone(&entry.session);
         let service = Arc::clone(self);
         let persist_handle = handle.clone();
-        Ok(self.spawn_task("publish", &handle, None, move |task| async move {
-            match publish_path(&session, &path, name).await {
-                Ok(published) => {
-                    service.bus.emit(
-                        "publish.completed",
-                        json!({
-                            "task": task,
-                            "hash": published.blob.hash.to_hex(),
-                            "name": published.blob.name,
-                            "size": published.total_size,
-                            "human_size": human_bytes(published.total_size),
-                            "members": published.members,
-                            "is_collection": published.is_collection,
-                        }),
-                    );
-                    // Our own broadcast produces no session event, so the
-                    // new frames would otherwise wait for the next trigger.
-                    // An offer is a membership-level fact: persist now.
-                    service.persist_drop(&persist_handle);
-                    Ok(())
+        Ok(
+            self.spawn_task("publish", &handle, None, move |task| async move {
+                match publish_path(&session, &path, name).await {
+                    Ok(published) => {
+                        service.bus.emit(
+                            "publish.completed",
+                            json!({
+                                "task": task,
+                                "hash": published.blob.hash.to_hex(),
+                                "name": published.blob.name,
+                                "size": published.total_size,
+                                "human_size": human_bytes(published.total_size),
+                                "members": published.members,
+                                "is_collection": published.is_collection,
+                            }),
+                        );
+                        // Our own broadcast produces no session event, so the
+                        // new frames would otherwise wait for the next trigger.
+                        // An offer is a membership-level fact: persist now.
+                        service.persist_drop(&persist_handle);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
                 }
-                Err(e) => Err(e.to_string()),
-            }
-        }))
+            }),
+        )
     }
 
     fn offer_fetch(self: &Arc<Self>, params: Value) -> ApiResult {
@@ -817,8 +835,8 @@ impl Service {
             .get("pick")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad_params("pick is required"))?;
-        let hash = resolve_pick(&entry.session, pick)
-            .map_err(|e| ApiError::not_found(e.to_string()))?;
+        let hash =
+            resolve_pick(&entry.session, pick).map_err(|e| ApiError::not_found(e.to_string()))?;
         let out = params
             .get("out")
             .and_then(Value::as_str)
@@ -1022,7 +1040,11 @@ impl Service {
             .into_iter()
             .map(|b| b.to_vec())
             .collect();
-        store.save(&self.persisted_table(), &entry.session.topic_id().to_string(), &frames);
+        store.save(
+            &self.persisted_table(),
+            &entry.session.topic_id().to_string(),
+            &frames,
+        );
     }
 
     fn persisted_table(&self) -> Vec<PersistedDrop> {
@@ -1147,7 +1169,10 @@ impl Service {
                 }
             }
             DropEvent::FetchCompleted { hash, provider } => {
-                self.progress_seen.lock().expect("progress").remove(&hash.to_hex());
+                self.progress_seen
+                    .lock()
+                    .expect("progress")
+                    .remove(&hash.to_hex());
                 self.bus.emit(
                     "fetch.completed",
                     json!({"drop": d, "hash": hash.to_hex(), "provider": provider.to_string()}),
@@ -1237,7 +1262,11 @@ impl Service {
                 );
                 return;
             };
-            if !answer.get("accept").and_then(Value::as_bool).unwrap_or(false) {
+            if !answer
+                .get("accept")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 service.bus.emit(
                     "offer.declined",
                     json!({"drop": handle, "hash": offer.blob_hash.to_hex(),
@@ -1263,18 +1292,23 @@ impl Service {
         out: PathBuf,
     ) -> Value {
         let service = Arc::clone(self);
-        self.spawn_task("fetch", handle, Some(hash.to_hex()), move |task| async move {
-            match iroh_drop_sdk::collections::fetch_any(&session, hash, &out).await {
-                Ok(paths) => {
-                    service.bus.emit(
-                        "fetch.materialized",
-                        json!({"task": task, "hash": hash.to_hex(), "paths": paths}),
-                    );
-                    Ok(())
+        self.spawn_task(
+            "fetch",
+            handle,
+            Some(hash.to_hex()),
+            move |task| async move {
+                match iroh_drop_sdk::collections::fetch_any(&session, hash, &out).await {
+                    Ok(paths) => {
+                        service.bus.emit(
+                            "fetch.materialized",
+                            json!({"task": task, "hash": hash.to_hex(), "paths": paths}),
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
                 }
-                Err(e) => Err(e.to_string()),
-            }
-        })
+            },
+        )
     }
 
     /// Long work never blocks a connection: allocate a task, return its id,
@@ -1385,7 +1419,10 @@ fn status_str(status: &LocalBlobStatus) -> &'static str {
 mod status_tests {
     #[test]
     fn failed_is_not_available() {
-        assert_eq!(super::status_str(&super::LocalBlobStatus::Missing), "missing");
+        assert_eq!(
+            super::status_str(&super::LocalBlobStatus::Missing),
+            "missing"
+        );
         assert_eq!(
             super::status_str(&super::LocalBlobStatus::Failed {
                 retryable: true,
@@ -1393,6 +1430,9 @@ mod status_tests {
             }),
             "failed"
         );
-        assert_eq!(super::status_str(&super::LocalBlobStatus::Complete), "available");
+        assert_eq!(
+            super::status_str(&super::LocalBlobStatus::Complete),
+            "available"
+        );
     }
 }

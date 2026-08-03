@@ -1,0 +1,16 @@
+[package]
+name = "iroh-drop-presence"
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Presence beacons on iroh-drop — the canonical extension example: a new message kind that interoperates through peers that do not implement it"
+
+[dependencies]
+iroh-drop = { path = "../iroh-drop" }
+iroh = { workspace = true }
+bytes = { workspace = true }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+iroh-drop = { path = "../iroh-drop" }
+tokio = { workspace = true }

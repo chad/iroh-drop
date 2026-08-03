@@ -28,7 +28,9 @@ pub mod rooms;
 
 pub use collections::{fetch_any, publish_path, Manifest, ManifestEntry, COLLECTION_MEDIA_TYPE};
 pub use config::Config;
-pub use inventory::{inventory, resolve_pick, InventoryItem};
+// Note: the `inventory` function itself stays under the `inventory` module
+// path — re-exporting it at the root would collide with the module name.
+pub use inventory::{resolve_pick, InventoryItem};
 #[cfg(feature = "mdns")]
 pub use nearby::{browse, NearbyDrop};
 pub use rooms::{Room, Rooms};

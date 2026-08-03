@@ -50,7 +50,10 @@ async fn restored_history_reconstructs_a_drop_after_cold_restart() {
     let history = session_b.export_history();
     assert!(!history.is_empty(), "a replica has history worth keeping");
     let topic = session_b.topic_id();
-    eprintln!("[t] exported {} frames; shutting down both lifetimes", history.len());
+    eprintln!(
+        "[t] exported {} frames; shutting down both lifetimes",
+        history.len()
+    );
     session_b.shutdown_no_announce().await;
     // Drop the session: its Arc keeps the old store open, and the rebuild
     // below would wait on that store's lock forever.

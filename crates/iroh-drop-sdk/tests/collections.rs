@@ -6,7 +6,7 @@ use iroh_drop::builder::{DropBuilder, DropProtocol, StackOptions};
 use iroh_drop::policy::DropPolicy;
 use iroh_drop::ticket::DropTicket;
 use iroh_drop_sdk::collections::{fetch_any, publish_path, COLLECTION_MEDIA_TYPE};
-use iroh_drop_sdk::inventory;
+use iroh_drop_sdk::inventory::inventory;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 

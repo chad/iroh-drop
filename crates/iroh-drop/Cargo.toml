@@ -1,6 +1,6 @@
 [package]
 name = "iroh-drop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A minimal announced-blob meta-protocol for Iroh: gossip announces immutable content, blobs transfers it"
@@ -12,14 +12,16 @@ default = []
 mdns = ["dep:iroh-mdns-address-lookup"]
 
 [dependencies]
-iroh = { workspace = true }
-iroh-blobs = { workspace = true }
-iroh-gossip = { workspace = true }
-tokio = { workspace = true }
+# Time/task shims: tokio re-exports natively, web-time/wasmtimer on wasm.
+n0-future = "0.3"
 thiserror = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 data-encoding = "2"
@@ -27,6 +29,29 @@ mime_guess = "2"
 rand = "0.9"
 iroh-mdns-address-lookup = { version = "0.4", optional = true }
 parking_lot = "0.12"
+
+# Native targets: full iroh stack (QUIC, port mapping, filesystem blob store)
+# and the complete tokio runtime.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+iroh = { workspace = true }
+iroh-blobs = { workspace = true }
+iroh-gossip = { workspace = true }
+tokio = { workspace = true }
+
+# Browsers: relay-only iroh (no QUIC/UDP, no port mapping), in-memory blob
+# store only (no fs-store/redb), and just the tokio pieces that exist on wasm.
+# NOTE: literal version specs, not workspace = true — cargo ignores
+# default-features = false on workspace-inherited deps unless the workspace
+# table itself declares default-features.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+iroh = { version = "1.0.3", default-features = false, features = ["tls-ring"] }
+iroh-blobs = { version = "0.103.0", default-features = false }
+iroh-gossip = { version = "0.101.0", default-features = false, features = ["net"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time", "macros"] }
+# rand 0.9 pulls getrandom 0.3, which refuses to compile for wasm32 without
+# its backend selected. The final wasm app must additionally pass
+# --cfg getrandom_backend="wasm_js" via RUSTFLAGS.
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

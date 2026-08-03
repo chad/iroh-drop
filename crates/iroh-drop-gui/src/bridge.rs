@@ -551,10 +551,7 @@ async fn handle_cmd(
             let _ = client.call("drop.leave", json!({"drop": handle})).await;
         }
         Cmd::Fetch { drop, pick, name } => {
-            state
-                .lock()
-                .expect("state")
-                .note(format!("getting {name}"));
+            state.lock().expect("state").note(format!("getting {name}"));
             if let Err(e) = client
                 .call("offer.fetch", json!({"drop": drop, "pick": pick}))
                 .await
@@ -590,15 +587,17 @@ async fn handle_cmd(
                 .transfers
                 .retain(|transfer| !transfer.finished);
         }
-        Cmd::Ticket { handle, name } => match client.call("drop.ticket", json!({"drop": handle})).await {
-            Ok(ticket) => {
-                let mut state = state.lock().expect("state");
-                state.share_link = Some(str_of(&ticket, "link"));
-                state.share_link_name = Some(name);
-                state.error = None;
+        Cmd::Ticket { handle, name } => {
+            match client.call("drop.ticket", json!({"drop": handle})).await {
+                Ok(ticket) => {
+                    let mut state = state.lock().expect("state");
+                    state.share_link = Some(str_of(&ticket, "link"));
+                    state.share_link_name = Some(name);
+                    state.error = None;
+                }
+                Err(e) => state.lock().expect("state").error = Some(e.msg),
             }
-            Err(e) => state.lock().expect("state").error = Some(e.msg),
-        },
+        }
     }
     refresh_status(client, state).await;
     ctx.request_repaint();
@@ -628,7 +627,11 @@ async fn do_send(client: &Arc<Client>, paths: &[PathBuf]) -> Result<String, Stri
 }
 
 fn send_label(paths: &[PathBuf]) -> String {
-    match paths.first().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()) {
+    match paths
+        .first()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+    {
         Some(first) if paths.len() > 1 => format!("{first} +{}", paths.len() - 1),
         Some(first) => first,
         None => "files".into(),
@@ -670,10 +673,14 @@ async fn do_receive(client: &Arc<Client>, input: &str) -> Result<String, String>
     }
 }
 
-/// Accept a bare ticket, a `drop1…` inside other text, or the fragment link.
+/// Accept a bare ticket, a `drop2…` inside other text, or the fragment link.
 pub fn extract_ticket(input: &str) -> Option<String> {
     let input = input.trim();
-    let start = input.find("drop1")?;
+    let start = input
+        .find("drop2")
+        .into_iter()
+        .chain(input.find("drop1"))
+        .min()?;
     let ticket: String = input[start..]
         .chars()
         .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
@@ -755,7 +762,11 @@ fn apply_event(
             let name = names.get(&hash).cloned().unwrap_or_else(|| "file".into());
             let done = env.p["downloaded"].as_u64().unwrap_or(0);
             let total = env.p["total"].as_u64();
-            match state.transfers.iter_mut().find(|t| t.name == name && !t.finished) {
+            match state
+                .transfers
+                .iter_mut()
+                .find(|t| t.name == name && !t.finished)
+            {
                 Some(existing) => {
                     existing.done = done;
                     existing.total = total;
@@ -780,7 +791,11 @@ fn apply_event(
                 .filter_map(|p| p.as_str().map(str::to_string))
                 .collect();
             let name = names.get(&hash).cloned().unwrap_or_else(|| "file".into());
-            match state.transfers.iter_mut().find(|t| t.name == name && !t.finished) {
+            match state
+                .transfers
+                .iter_mut()
+                .find(|t| t.name == name && !t.finished)
+            {
                 Some(existing) => {
                     existing.finished = true;
                     existing.saved_to = paths;
@@ -800,7 +815,11 @@ fn apply_event(
         "fetch.failed" => {
             let name = names.get(&hash).cloned().unwrap_or_else(|| "file".into());
             let error = str_of(&env.p, "error");
-            match state.transfers.iter_mut().find(|t| t.name == name && !t.finished) {
+            match state
+                .transfers
+                .iter_mut()
+                .find(|t| t.name == name && !t.finished)
+            {
                 Some(existing) => {
                     existing.finished = true;
                     existing.failed = Some(error);
@@ -826,7 +845,7 @@ fn str_of(value: &Value, key: &str) -> String {
 mod tests {
     use super::extract_ticket;
 
-    const TICKET: &str = "drop1aimfofis3yfxv6oqyama7hct5hgil7ozmrwh4u7ryd6ihbtadeesuaitapjhbfsnoh";
+    const TICKET: &str = "drop2aimfofis3yfxv6oqyama7hct5hgil7ozmrwh4u7ryd6ihbtadeesuaitapjhbfsnoh";
 
     #[test]
     fn accepts_a_bare_ticket() {
@@ -857,7 +876,7 @@ mod tests {
         assert!(extract_ticket("").is_none());
         assert!(extract_ticket("hello").is_none());
         // A prefix alone is a typo, not a capability.
-        assert!(extract_ticket("drop1").is_none());
-        assert!(extract_ticket("drop1abc").is_none());
+        assert!(extract_ticket("drop2").is_none());
+        assert!(extract_ticket("drop2abc").is_none());
     }
 }

@@ -64,25 +64,51 @@ pub mod limits;
 pub mod message;
 pub mod policy;
 pub mod provider;
+pub mod seal;
 pub mod session;
 pub mod state;
 mod sync;
 pub mod ticket;
+pub mod transport;
 
 pub use builder::{CreateOptions, DropBuilder, DropProtocol, DropStack, StackOptions};
+// Re-exported so hosts that manage identity themselves (browsers, mobile
+// keychains) can construct `StackOptions::secret_key` without depending on
+// iroh directly.
 pub use error::{
     DropError, IntegrityError, NetworkError, PolicyError, ProtocolError, ProtocolWarningKind,
     RejectReason, StorageError, TicketError,
 };
 pub use hash::BlobHash;
+pub use seal::{DropKey, KIND_SEALED, SEALED_WIRE_VERSION};
+pub use transport::{DropTransport, GossipTransport, TransportEvent};
+
+/// The gossip topic identifier used throughout the public API.
+pub use iroh_gossip::proto::TopicId;
+
+/// Wire-format hooks for fuzz targets and external conformance harnesses.
+/// Not public API: names, fields, and presence here may change with the
+/// wire version. Everything reachable from a peer's bytes must be decoded
+/// through these types somewhere — the fuzzers prove none of it panics.
+#[doc(hidden)]
+pub mod wire {
+    pub use crate::sync::{
+        ControlRequestV1, ControlResponseV1, HelloV1, SyncRequestV1, SyncResponseV1,
+    };
+}
+pub use iroh::SecretKey;
 pub use message::{
-    MessageBodyV1, MessageV1, OfferV1, ProviderState, ProviderV1, RequestV1, VerifiedMessage,
-    MAX_MESSAGE_SIZE, WIRE_VERSION,
+    ExtensionV1, MessageBodyV1, MessageV1, OfferV1, ProviderState, ProviderV1, RequestV1,
+    VerifiedMessage, KIND_EXTENSION, MAX_MESSAGE_SIZE, WIRE_VERSION,
 };
 pub use policy::DropPolicy;
-pub use session::{DropEvent, DropSession, FetchOutput, FetchResult, PublishedBlob};
-pub use state::{LocalBlobStatus, OfferRecord};
-pub use ticket::{DropTicket, DropTicketOptionsV1, DropTicketV1, TICKET_PREFIX};
+pub use session::{
+    DropEvent, DropSession, ExtensionFrame, FetchOutput, FetchResult, PublishedBlob,
+};
+pub use state::{LocalBlobStatus, OfferRecord, ResolveOfferError};
+pub use ticket::{
+    DropMode, DropTicket, DropTicketOptionsV1, DropTicketV1, TicketAddrV1, TICKET_PREFIX,
+};
 
 /// Reserved ALPN for future direct control operations (inventory exchange,
 /// provider queries, historical sync). Unused in wire version 1: coordination

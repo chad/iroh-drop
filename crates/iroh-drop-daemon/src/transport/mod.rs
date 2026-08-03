@@ -10,7 +10,7 @@
 //!   guard, because some platforms have historically ignored permission bits on
 //!   socket files, and nobody ignores them on a directory you must traverse.
 //! - **Windows**: a named pipe under `\\.\pipe\`, whose default DACL grants the
-//!   creating user (see [`windows`] for what that does and does not cover).
+//!   creating user (see the `windows` module for what that does and does not cover).
 //!
 //! Only the listener differs per platform. Everything below is generic over
 //! [`AsyncRead`]/[`AsyncWrite`], and everything above [`Service::attach`] does

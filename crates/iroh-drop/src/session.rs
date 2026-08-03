@@ -14,8 +14,12 @@ use std::sync::Arc;
 // parking_lot locks cannot be poisoned: one panic inside a critical section
 // must not turn every later lock acquisition into a panic as well.
 use parking_lot::{Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use n0_future::time::{Instant, SystemTime};
+
+use crate::seal::DropKey;
+use crate::transport::{DropTransport, TransportEvent, TransportEventStream};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::{EndpointAddr, EndpointId, SecretKey};
@@ -24,10 +28,9 @@ use iroh_blobs::api::proto::BlobStatus;
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::protocol::GetRequest;
 use iroh_blobs::HashAndFormat;
-use iroh_gossip::api::{Event as GossipEvent, GossipReceiver, GossipSender};
 use iroh_gossip::proto::TopicId;
+use n0_future::task::JoinSet;
 use tokio::sync::{broadcast, watch, Semaphore};
-use tokio::task::JoinSet;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::builder::DropStack;
@@ -38,8 +41,8 @@ use crate::error::{
 use crate::hash::BlobHash;
 use crate::limits::{self, PeerRateLimiter};
 use crate::message::{
-    collision_safe_path, validate_name, MessageBodyV1, MessageV1, OfferV1, ProviderState,
-    ProviderV1, RequestV1,
+    collision_safe_path, validate_name, ExtensionV1, MessageBodyV1, MessageV1, OfferV1,
+    ProviderState, ProviderV1, RequestV1, MAX_BODY_SIZE,
 };
 use crate::policy::{DropPolicy, OfferContext, OfferDecider, OfferDecision};
 use crate::state::{DropState, LocalBlobStatus, OfferRecord};
@@ -67,6 +70,11 @@ const ANTI_ENTROPY_PEERS_CAP: usize = 512;
 
 /// Capacity of the event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 512;
+
+/// Capacity of each extension-kind channel. A lagging extension consumer
+/// loses frames rather than slowing the session; a fresh [`DropSession::on_extension`]
+/// replays what the retained log still holds.
+const EXTENSION_CHANNEL_CAPACITY: usize = 256;
 
 /// Events emitted by a [`DropSession`], tagged by subsystem in the CLI.
 ///
@@ -162,6 +170,29 @@ pub enum DropEvent {
     },
 }
 
+/// A signature-verified gossip frame carrying a message kind this crate
+/// does not implement — the raw material of extension protocols.
+///
+/// The author is cryptographically attributable (the frame's signature was
+/// verified on receipt), but the payload is untrusted, opaque, and
+/// meaningful only to the extension that defined the kind.
+#[derive(Clone, Debug)]
+pub struct ExtensionFrame {
+    /// The verified author of the frame.
+    pub author: EndpointId,
+    /// The message's dedup id. Extensions that republish or reply should
+    /// track these to stay idempotent.
+    pub id: [u8; 16],
+    /// The extension protocol's namespace (matches the subscription).
+    pub namespace: [u8; 16],
+    /// The extension protocol's own message number.
+    pub local_kind: u32,
+    /// The extension protocol's payload schema version.
+    pub schema_version: u16,
+    /// The extension's opaque payload.
+    pub payload: Bytes,
+}
+
 /// Where a completed fetch should put its bytes.
 #[derive(Clone, Debug)]
 pub enum FetchOutput {
@@ -231,7 +262,13 @@ pub(crate) struct SessionInner {
     policy: DropPolicy,
     pub(crate) topic_id: TopicId,
     ticket: RwLock<DropTicket>,
-    sender: GossipSender,
+    transport: Arc<dyn DropTransport>,
+    /// Present iff this is a private drop (sealed wire family 4).
+    pub(crate) drop_key: Option<DropKey>,
+    /// Participation mode from the ticket: which family this session speaks.
+    /// `Sealed` without a key is a blind relay — retains and relays sealed
+    /// frames, never decrypts, publishes, or serves history.
+    pub(crate) mode: crate::ticket::DropMode,
     pub(crate) state: RwLock<DropState>,
     events: broadcast::Sender<DropEvent>,
     /// Weak handle to the shutdown guard, used to spawn internal tasks that
@@ -254,6 +291,9 @@ pub(crate) struct SessionInner {
     provider_timeout: Duration,
     secret: SecretKey,
     temp_tags: Mutex<Vec<TempTag>>,
+    /// Live extension subscriptions by namespace, created lazily by
+    /// `on_extension`.
+    extension_sinks: Mutex<HashMap<[u8; 16], broadcast::Sender<ExtensionFrame>>>,
 }
 
 impl SessionInner {
@@ -284,21 +324,25 @@ impl DropSession {
         decider: Arc<dyn OfferDecider>,
         topic_id: TopicId,
         ticket: DropTicket,
-        sender: GossipSender,
-        receiver: GossipReceiver,
+        transport: Arc<dyn DropTransport>,
+        drop_key: Option<DropKey>,
     ) -> Self {
         let self_id = stack.endpoint.id();
         let secret = stack.endpoint.secret_key().clone();
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let guard = Arc::new(SessionGuard(shutdown));
+        let event_stream = transport.take_events();
+        let provider_timeout = policy.provider_timeout;
         let inner = Arc::new(SessionInner {
             stack,
             policy: policy.clone(),
             decider,
             topic_id,
+            mode: ticket.mode(),
             ticket: RwLock::new(ticket),
-            sender,
+            transport,
+            drop_key,
             state: RwLock::new(DropState::new(topic_id, self_id, policy)),
             events,
             guard: Arc::downgrade(&guard),
@@ -312,9 +356,10 @@ impl DropSession {
             request_replies: Mutex::new(HashMap::new()),
             message_limiter: Mutex::new(PeerRateLimiter::new(limits::MESSAGES)),
             request_limiter: Mutex::new(PeerRateLimiter::new(limits::REQUESTS)),
-            provider_timeout: DEFAULT_PROVIDER_TIMEOUT,
+            provider_timeout,
             secret,
             temp_tags: Mutex::new(Vec::new()),
+            extension_sinks: Mutex::new(HashMap::new()),
         });
         // Register for the catch-up sync accept handler.
         inner
@@ -326,7 +371,7 @@ impl DropSession {
         inner
             .tasks
             .lock()
-            .spawn(run_event_loop(task_inner, receiver, shutdown_rx));
+            .spawn(run_event_loop(task_inner, event_stream, shutdown_rx));
         DropSession { inner, guard }
     }
 
@@ -404,11 +449,7 @@ impl DropSession {
     /// resolve them — pair with [`crate::DropStack::add_known_addr`] when
     /// the addresses are new. Duplicate or stale peers are harmless.
     pub async fn join_peers(&self, peers: Vec<EndpointId>) -> Result<(), DropError> {
-        self.inner
-            .sender
-            .join_peers(peers)
-            .await
-            .map_err(|e| DropError::Protocol(ProtocolError::Gossip(e.to_string())))
+        self.inner.transport.join_peers(peers).await
     }
 
     /// Our endpoint identity.
@@ -440,7 +481,10 @@ impl DropSession {
     }
 
     /// Resolve a hash, hash prefix, name, or alias to a content hash.
-    pub fn resolve(&self, hash_or_name: &str) -> Option<BlobHash> {
+    ///
+    /// Names are display strings, not identities: an ambiguous name is an
+    /// error listing the candidates, never an arbitrary pick.
+    pub fn resolve(&self, hash_or_name: &str) -> Result<BlobHash, crate::state::ResolveOfferError> {
         self.inner.state.read().find_offer(hash_or_name)
     }
 
@@ -679,8 +723,8 @@ impl DropSession {
             size,
             media_type: media_type.clone(),
             created_at_ms: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0),
             ),
@@ -1065,7 +1109,7 @@ impl DropSession {
             if start.elapsed() > self.inner.provider_timeout {
                 return Vec::new();
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            n0_future::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1074,31 +1118,131 @@ impl DropSession {
     async fn broadcast_when_joined(&self, body: MessageBodyV1) -> Result<(), DropError> {
         if self.inner.neighbors.load(Ordering::SeqCst) == 0 {
             let notified = self.inner.neighbor_notify.notified();
-            let _ = tokio::time::timeout(JOIN_WAIT, notified).await;
+            let _ = n0_future::time::timeout(JOIN_WAIT, notified).await;
         }
         self.broadcast(body).await
     }
 
     async fn broadcast(&self, body: MessageBodyV1) -> Result<(), DropError> {
-        let retainable = matches!(body, MessageBodyV1::Offer(_) | MessageBodyV1::Provider(_));
-        let msg = MessageV1::new(body);
-        let bytes = msg.encode(&self.inner.secret)?;
+        let retain = match body {
+            MessageBodyV1::Offer(_) | MessageBodyV1::Provider(_) => Retain::Yes,
+            MessageBodyV1::Request(_) => Retain::No,
+            // Extensions get relay duty, not history: bounded by the
+            // unknown-frame budget, replayable to late subscribers while
+            // retained, never served as catch-up history for core state.
+            MessageBodyV1::Extension(_) => Retain::Unknown,
+        };
+        self.broadcast_signed(MessageV1::new(body), retain).await
+    }
+
+    /// Sign, pre-dedupe our own echo, retain per `retain`, and broadcast.
+    async fn broadcast_signed(&self, msg: MessageV1, retain: Retain) -> Result<(), DropError> {
+        // The session's family is fixed by its ticket's mode: sealed drops
+        // seal every frame (family 4), public drops speak family 3. A blind
+        // relay (sealed, no key) has nothing it may say.
+        let bytes = match (self.inner.mode, &self.inner.drop_key) {
+            (crate::ticket::DropMode::Sealed, Some(key)) => {
+                msg.encode_sealed(&self.inner.secret, key, &self.inner.topic_id)?
+            }
+            (crate::ticket::DropMode::Sealed, None) => {
+                return Err(DropError::Protocol(ProtocolError::NoDropKey));
+            }
+            (crate::ticket::DropMode::Public, _) => {
+                msg.encode(&self.inner.secret, &self.inner.topic_id)?
+            }
+        };
         {
             let mut state = self.inner.state.write();
             // Our own echo is already applied locally; skip it on receipt.
             state
                 .seen_messages
                 .check_and_insert((self.self_id(), msg.id));
-            if retainable {
-                state.retain_frame(Bytes::copy_from_slice(&bytes));
+            match retain {
+                Retain::Yes => state.retain_frame(Bytes::copy_from_slice(&bytes)),
+                Retain::Unknown => state.retain_unknown_frame(Bytes::copy_from_slice(&bytes)),
+                Retain::No => {}
             }
         }
-        self.inner
-            .sender
-            .broadcast(Bytes::from(bytes))
-            .await
-            .map_err(|e| DropError::Network(NetworkError::Gossip(e.to_string())))?;
+        self.inner.transport.broadcast(Bytes::from(bytes)).await?;
         Ok(())
+    }
+
+    /// Broadcast a namespaced extension frame. The frame is signed, and
+    /// peers that do not know `namespace` verify, relay, and retain it
+    /// anyway — an extension propagates through peers that predate it, and
+    /// late subscribers replay it from retained history.
+    ///
+    /// The payload is opaque to the protocol: never interpreted, never
+    /// validated beyond the [`MAX_BODY_SIZE`] cap, and untrusted on
+    /// receipt. Our own frames are not delivered back to our
+    /// [`Self::on_extension`] subscribers.
+    ///
+    /// Kind numbers are the core spec's; applications only ever choose a
+    /// namespace, their own `local_kind`, and their `schema_version`.
+    pub async fn send_extension(
+        &self,
+        namespace: [u8; 16],
+        local_kind: u32,
+        schema_version: u16,
+        payload: Bytes,
+    ) -> Result<(), DropError> {
+        if payload.len() > MAX_BODY_SIZE {
+            return Err(ProtocolError::MessageTooLarge(payload.len()).into());
+        }
+        self.broadcast(MessageBodyV1::Extension(ExtensionV1 {
+            namespace,
+            local_kind,
+            schema_version,
+            payload: payload.to_vec(),
+        }))
+        .await
+    }
+
+    /// Subscribe to verified frames of an extension namespace: everything
+    /// already in the retained history (including what catch-up sync pulled
+    /// before this session joined), followed by everything that arrives
+    /// live.
+    ///
+    /// Frames arrive exactly once in practice (the session's dedup cache
+    /// separates replay from live delivery), but extensions should treat
+    /// delivery as at-least-once and stay idempotent — [`ExtensionFrame::id`]
+    /// exists for that. A lagging receiver loses frames rather than slowing
+    /// the session; subscribing again replays what the bounded retained log
+    /// still holds.
+    ///
+    /// Cost note: replay decodes the retained log (bounded by the history
+    /// cap, worst case a few thousand frames) to filter by namespace.
+    pub fn on_extension(&self, namespace: [u8; 16]) -> broadcast::Receiver<ExtensionFrame> {
+        let tx = {
+            let mut sinks = self.inner.extension_sinks.lock();
+            sinks
+                .entry(namespace)
+                .or_insert_with(|| broadcast::channel(EXTENSION_CHANNEL_CAPACITY).0)
+                .clone()
+        };
+        // Subscribe before replaying: a live frame can only be delivered
+        // once, because anything already retained is also already deduped
+        // against a live re-delivery.
+        let rx = tx.subscribe();
+        let retained = self.inner.state.read().retained_frames();
+        for frame in retained {
+            let Ok(verified) = decode_for_session(&self.inner, &frame) else {
+                continue;
+            };
+            if let Some(MessageBodyV1::Extension(ext)) = verified.body {
+                if ext.namespace == namespace {
+                    let _ = tx.send(ExtensionFrame {
+                        author: verified.author,
+                        id: verified.message.id,
+                        namespace: ext.namespace,
+                        local_kind: ext.local_kind,
+                        schema_version: ext.schema_version,
+                        payload: Bytes::from(ext.payload),
+                    });
+                }
+            }
+        }
+        rx
     }
 
     /// The shared internals, for crate-internal helpers (catch-up sync).
@@ -1125,11 +1269,7 @@ impl DropSession {
     /// survives them.
     #[doc(hidden)]
     pub async fn inject_raw_message(&self, bytes: Bytes) -> Result<(), DropError> {
-        self.inner
-            .sender
-            .broadcast(bytes)
-            .await
-            .map_err(|e| DropError::Network(NetworkError::Gossip(e.to_string())))
+        self.inner.transport.broadcast(bytes).await
     }
 
     /// Announce withdrawal for everything we serve, without stopping. A
@@ -1146,7 +1286,7 @@ impl DropSession {
                 .collect()
         };
         for hash in complete {
-            let _ = tokio::time::timeout(
+            let _ = n0_future::time::timeout(
                 Duration::from_secs(1),
                 self.broadcast(MessageBodyV1::Provider(ProviderV1 {
                     blob_hash: hash,
@@ -1196,7 +1336,7 @@ impl DropSession {
     pub async fn restore_history(&self, frames: Vec<Bytes>) -> usize {
         let mut applied = 0;
         for frame in frames {
-            let Ok(verified) = MessageV1::decode(&frame) else {
+            let Ok(verified) = MessageV1::decode(&frame, &self.inner.topic_id) else {
                 continue;
             };
             let author = verified.author;
@@ -1216,10 +1356,20 @@ impl DropSession {
                     let announced_at = provider.announced_at_ms.unwrap_or(0);
                     match provider.state {
                         ProviderState::Available => {
-                            state.record_provider(provider.blob_hash, author, announced_at);
+                            state.record_provider(
+                                provider.blob_hash,
+                                author,
+                                announced_at,
+                                message.id,
+                            );
                         }
                         ProviderState::Withdrawing => {
-                            state.withdraw_provider(provider.blob_hash, author, announced_at);
+                            state.withdraw_provider(
+                                provider.blob_hash,
+                                author,
+                                announced_at,
+                                message.id,
+                            );
                         }
                     }
                     applied += 1;
@@ -1269,24 +1419,20 @@ impl DropSession {
 /// stream ends.
 async fn run_event_loop(
     inner: Arc<SessionInner>,
-    mut receiver: GossipReceiver,
+    mut events: TransportEventStream,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                trace!("gossip loop: shutdown signalled");
+                trace!("transport event loop: shutdown signalled");
                 break;
             }
-            item = receiver.next() => {
+            item = events.next() => {
                 match item {
-                    Some(Ok(event)) => handle_gossip_event(&inner, event).await,
-                    Some(Err(e)) => {
-                        warn!("gossip receiver error: {e}");
-                        break;
-                    }
+                    Some(event) => handle_transport_event(&inner, event).await,
                     None => {
-                        debug!("gossip stream ended");
+                        debug!("transport event stream ended");
                         break;
                     }
                 }
@@ -1295,9 +1441,30 @@ async fn run_event_loop(
     }
 }
 
-async fn handle_gossip_event(inner: &Arc<SessionInner>, event: GossipEvent) {
+/// Decode an incoming frame in the session's wire family: sealed (3) for
+/// private drops, plain (2) for public ones. A frame from the *other*
+/// family fails cleanly — `UnsupportedVersion` — which the error arm of
+/// the caller reports as an observable warning.
+pub(crate) fn decode_for_session(
+    inner: &Arc<SessionInner>,
+    content: &Bytes,
+) -> Result<crate::message::VerifiedMessage, ProtocolError> {
+    match (inner.mode, &inner.drop_key) {
+        (crate::ticket::DropMode::Sealed, Some(key)) => {
+            MessageV1::decode_sealed(content, key, &inner.topic_id)
+        }
+        // Blind relay: verify the outer signature so dedup, retention, and
+        // relaying work, but the body stays sealed.
+        (crate::ticket::DropMode::Sealed, None) => {
+            MessageV1::verify_sealed_outer(content, &inner.topic_id)
+        }
+        (crate::ticket::DropMode::Public, _) => MessageV1::decode(content, &inner.topic_id),
+    }
+}
+
+async fn handle_transport_event(inner: &Arc<SessionInner>, event: TransportEvent) {
     match event {
-        GossipEvent::NeighborUp(peer) => {
+        TransportEvent::NeighborUp(peer) => {
             {
                 let mut state = inner.state.write();
                 state.known_peers.insert(peer);
@@ -1307,66 +1474,71 @@ async fn handle_gossip_event(inner: &Arc<SessionInner>, event: GossipEvent) {
             let _ = inner.events.send(DropEvent::PeerJoined { peer });
             maybe_sync_from_neighbor(inner, peer);
         }
-        GossipEvent::NeighborDown(peer) => {
-            let prev = inner.neighbors.load(Ordering::SeqCst);
+        TransportEvent::NeighborDown(peer) => {
+            // One atomic step, never load-then-store: the gossip event loop is
+            // the only writer today, but a saturating fetch_update keeps that
+            // assumption from becoming a race the day a second writer appears.
             inner
                 .neighbors
-                .store(prev.saturating_sub(1), Ordering::SeqCst);
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    Some(n.saturating_sub(1))
+                })
+                .ok();
             let _ = inner.events.send(DropEvent::PeerLeft { peer });
         }
-        GossipEvent::Received(msg) => {
-            let delivered_from = msg.delivered_from;
-            match MessageV1::decode(&msg.content) {
-                Ok(verified) => {
-                    handle_message(
-                        inner,
-                        verified.author,
-                        verified.message,
-                        verified.body,
-                        delivered_from,
-                        msg.content.clone(),
-                    )
-                    .await
-                }
-                Err(e) => {
-                    let (reason, warning) = match &e {
-                        ProtocolError::UnsupportedVersion(v) => (
-                            RejectReason::UnsupportedVersion(*v),
-                            ProtocolWarningKind::UnsupportedVersion { version: *v },
-                        ),
-                        ProtocolError::InvalidSignature => (
-                            RejectReason::InvalidSignature,
-                            ProtocolWarningKind::InvalidSignature,
-                        ),
-                        ProtocolError::MessageTooLarge(size) => (
-                            RejectReason::Malformed(e.to_string()),
-                            ProtocolWarningKind::Oversized { size: *size },
-                        ),
-                        ProtocolError::InvalidName(m) => (
-                            RejectReason::InvalidName(m.clone()),
-                            ProtocolWarningKind::Malformed {
-                                reason: e.to_string(),
-                            },
-                        ),
-                        other => (
-                            RejectReason::Malformed(other.to_string()),
-                            ProtocolWarningKind::Malformed {
-                                reason: other.to_string(),
-                            },
-                        ),
-                    };
-                    let _ = inner.events.send(DropEvent::OfferRejected {
-                        from: delivered_from,
-                        reason,
-                    });
-                    let _ = inner.events.send(DropEvent::ProtocolWarning {
-                        from: Some(delivered_from),
-                        warning,
-                    });
-                }
+        TransportEvent::Received {
+            content,
+            delivered_from,
+        } => match decode_for_session(inner, &content) {
+            Ok(verified) => {
+                handle_message(
+                    inner,
+                    verified.author,
+                    verified.message,
+                    verified.body,
+                    delivered_from,
+                    content.clone(),
+                )
+                .await
             }
-        }
-        GossipEvent::Lagged => {
+            Err(e) => {
+                let (reason, warning) = match &e {
+                    ProtocolError::UnsupportedVersion(v) => (
+                        RejectReason::UnsupportedVersion(*v),
+                        ProtocolWarningKind::UnsupportedVersion { version: *v },
+                    ),
+                    ProtocolError::InvalidSignature => (
+                        RejectReason::InvalidSignature,
+                        ProtocolWarningKind::InvalidSignature,
+                    ),
+                    ProtocolError::MessageTooLarge(size) => (
+                        RejectReason::Malformed(e.to_string()),
+                        ProtocolWarningKind::Oversized { size: *size },
+                    ),
+                    ProtocolError::InvalidName(m) => (
+                        RejectReason::InvalidName(m.clone()),
+                        ProtocolWarningKind::Malformed {
+                            reason: e.to_string(),
+                        },
+                    ),
+                    other => (
+                        RejectReason::Malformed(other.to_string()),
+                        ProtocolWarningKind::Malformed {
+                            reason: other.to_string(),
+                        },
+                    ),
+                };
+                let _ = inner.events.send(DropEvent::OfferRejected {
+                    from: delivered_from,
+                    reason,
+                });
+                let _ = inner.events.send(DropEvent::ProtocolWarning {
+                    from: Some(delivered_from),
+                    warning,
+                });
+            }
+        },
+        TransportEvent::Lagged => {
             let _ = inner.events.send(DropEvent::ProtocolWarning {
                 from: None,
                 warning: ProtocolWarningKind::Lagged,
@@ -1400,9 +1572,10 @@ fn maybe_sync_from_neighbor(inner: &Arc<SessionInner>, peer: EndpointId) {
     }
     // Id-only address on purpose: we are already gossiping with this peer,
     // so discovery has just demonstrated it can resolve them.
-    inner
-        .clone()
-        .spawn_task(crate::sync::sync_catchup(inner.clone(), vec![EndpointAddr::from(peer)]));
+    inner.clone().spawn_task(crate::sync::sync_catchup(
+        inner.clone(),
+        vec![EndpointAddr::from(peer)],
+    ));
 }
 
 pub(crate) async fn handle_message(
@@ -1420,6 +1593,9 @@ pub(crate) async fn handle_message(
     // still relay extensions it does not implement.
     let retainable = match &body {
         Some(MessageBodyV1::Offer(_)) | Some(MessageBodyV1::Provider(_)) => Retain::Yes,
+        // Extensions get relay duty, not history: the unknown-frame budget
+        // bounds them, and late subscribers can replay what is retained.
+        Some(MessageBodyV1::Extension(_)) => Retain::Unknown,
         Some(_) => Retain::No,
         None => Retain::Unknown,
     };
@@ -1453,12 +1629,19 @@ pub(crate) async fn handle_message(
     let Some(body) = body else {
         // A kind from the future (or from an application extension). We
         // verified it, we will relay it, and we do not pretend to understand
-        // it.
+        // it. On a blind relay this is the *normal* case — every sealed
+        // frame arrives verified-but-undecrypted — so don't warn there.
         trace!(%author, kind, "ignoring unknown message kind");
-        let _ = inner.events.send(DropEvent::ProtocolWarning {
-            from: Some(delivered_from),
-            warning: ProtocolWarningKind::UnknownKind { kind },
-        });
+        if kind != crate::KIND_SEALED {
+            let _ = inner.events.send(DropEvent::ProtocolWarning {
+                from: Some(delivered_from),
+                warning: ProtocolWarningKind::UnknownKind { kind },
+            });
+        }
+        // Unknown numeric kinds are relayed, never delivered: application
+        // protocols ride the namespaced extension envelope, so a bare kind
+        // has no subscriber to notify. A future core kind will teach new
+        // builds to decode it.
         return;
     };
     match body {
@@ -1471,9 +1654,11 @@ pub(crate) async fn handle_message(
             let applied = {
                 let mut state = inner.state.write();
                 match provider.state {
-                    ProviderState::Available => state.record_provider(hash, author, announced_at),
+                    ProviderState::Available => {
+                        state.record_provider(hash, author, announced_at, message.id)
+                    }
                     ProviderState::Withdrawing => {
-                        state.withdraw_provider(hash, author, announced_at)
+                        state.withdraw_provider(hash, author, announced_at, message.id)
                     }
                 }
             };
@@ -1492,13 +1677,28 @@ pub(crate) async fn handle_message(
         MessageBodyV1::Request(request) => {
             handle_request(inner, request.blob_hash, delivered_from).await;
         }
+        MessageBodyV1::Extension(ext) => {
+            // Deliver to whoever subscribed this namespace. The frame was
+            // already retained above, so a missed delivery can still be
+            // replayed by a fresh `on_extension`.
+            if let Some(tx) = inner.extension_sinks.lock().get(&ext.namespace) {
+                let _ = tx.send(ExtensionFrame {
+                    author,
+                    id: message.id,
+                    namespace: ext.namespace,
+                    local_kind: ext.local_kind,
+                    schema_version: ext.schema_version,
+                    payload: Bytes::from(ext.payload),
+                });
+            }
+        }
     }
 }
 
 /// Milliseconds since the Unix epoch, for self-asserted ordering.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
@@ -1679,9 +1879,9 @@ async fn handle_request(inner: &Arc<SessionInner>, hash: BlobHash, asker: Endpoi
         state: ProviderState::Available,
         announced_at_ms: Some(now_ms()),
     }));
-    match msg.encode(&inner.secret) {
+    match msg.encode(&inner.secret, &inner.topic_id) {
         Ok(bytes) => {
-            if let Err(e) = inner.sender.broadcast(Bytes::from(bytes)).await {
+            if let Err(e) = inner.transport.broadcast(Bytes::from(bytes)).await {
                 warn!("failed to answer provider request: {e}");
             }
         }

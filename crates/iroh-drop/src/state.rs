@@ -6,7 +6,9 @@
 //! provider history, and membership.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use n0_future::time::Instant;
 
 use bytes::Bytes;
 use iroh::EndpointId;
@@ -59,6 +61,15 @@ pub const MAX_UNKNOWN_FRAMES: usize = 256;
 /// them. Oldest-first eviction when full.
 pub const SYNC_LOG_CAP: usize = 4096;
 
+/// Byte bound on the sync log. The frame count cap alone permits
+/// 4096 x 64KiB worst-case frames — 256 MiB per topic. Eviction happens on
+/// either bound, whichever bites first.
+pub const SYNC_LOG_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Byte budget for frames of unknown kinds, across the life of the session
+/// (like [`MAX_UNKNOWN_FRAMES`], spent rather than sliding).
+pub const UNKNOWN_FRAMES_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// What happened when an offer was recorded.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -96,6 +107,10 @@ pub struct SyncPage {
     pub end_cursor: u64,
     /// Whether the page reaches the current end of the log.
     pub caught_up: bool,
+    /// Absolute cursor of the oldest frame still retained. A request cursor
+    /// below this (and not the special "from the beginning" 0) means the
+    /// requester's expected frames were evicted: the page is truncated.
+    pub oldest_cursor: u64,
 }
 
 /// Bounded dedup cache with TTL and oldest-first eviction.
@@ -259,9 +274,13 @@ pub struct DropState {
     peer_order: VecDeque<EndpointId>,
     /// How many retained frames carry kinds we do not understand.
     unknown_frames: usize,
+    /// Bytes retained for unknown kinds; spent like the count budget.
+    unknown_frames_bytes: usize,
     /// Retained signed frames (offers and provider announcements) for
     /// catch-up sync, in the order they were accepted.
     sync_log: VecDeque<Bytes>,
+    /// Total bytes in `sync_log`; eviction is count- AND byte-bounded.
+    sync_log_bytes: usize,
     /// Absolute sequence number of `sync_log`'s front element (grows as the
     /// log evicts from the front); used as the sync cursor base.
     sync_log_start: u64,
@@ -282,7 +301,9 @@ impl DropState {
             offers_per_author: HashMap::new(),
             peer_order: VecDeque::new(),
             unknown_frames: 0,
+            unknown_frames_bytes: 0,
             sync_log: VecDeque::new(),
+            sync_log_bytes: 0,
             sync_log_start: 0,
         }
     }
@@ -306,11 +327,12 @@ impl DropState {
         hash: BlobHash,
         peer: EndpointId,
         announced_at_ms: u64,
+        frame_id: [u8; 16],
     ) -> bool {
         self.providers
             .entry(hash)
             .or_default()
-            .record(peer, announced_at_ms, false)
+            .record(peer, announced_at_ms, frame_id, false)
     }
 
     /// Apply a withdrawal, newest-wins.
@@ -319,11 +341,12 @@ impl DropState {
         hash: BlobHash,
         peer: EndpointId,
         announced_at_ms: u64,
+        frame_id: [u8; 16],
     ) -> bool {
         self.providers
             .entry(hash)
             .or_default()
-            .record(peer, announced_at_ms, true)
+            .record(peer, announced_at_ms, frame_id, true)
     }
 
     /// Note that this offer was just seen, moving it to the back of the
@@ -362,12 +385,19 @@ impl DropState {
         evicted
     }
 
-    /// Retain a signed frame for catch-up sync.
+    /// Retain a signed frame for catch-up sync. Evicts oldest-first when
+    /// either the count cap or the byte cap would be exceeded.
     pub fn retain_frame(&mut self, frame: Bytes) {
-        if self.sync_log.len() >= SYNC_LOG_CAP {
-            self.sync_log.pop_front();
-            self.sync_log_start += 1;
+        while !self.sync_log.is_empty()
+            && (self.sync_log.len() >= SYNC_LOG_CAP
+                || self.sync_log_bytes + frame.len() > SYNC_LOG_MAX_BYTES)
+        {
+            if let Some(evicted) = self.sync_log.pop_front() {
+                self.sync_log_bytes -= evicted.len();
+                self.sync_log_start += 1;
+            }
         }
+        self.sync_log_bytes += frame.len();
         self.sync_log.push_back(frame);
     }
 
@@ -375,11 +405,22 @@ impl DropState {
     /// peer still relays extensions to peers that do. Bounded separately and
     /// much more tightly than known kinds.
     pub fn retain_unknown_frame(&mut self, frame: Bytes) {
-        if self.unknown_frames >= MAX_UNKNOWN_FRAMES {
+        if self.unknown_frames >= MAX_UNKNOWN_FRAMES
+            || self.unknown_frames_bytes + frame.len() > UNKNOWN_FRAMES_MAX_BYTES
+        {
             return;
         }
         self.unknown_frames += 1;
+        self.unknown_frames_bytes += frame.len();
         self.retain_frame(frame);
+    }
+
+    /// Every retained frame in the sync log, in acceptance order. Bounded
+    /// by [`SYNC_LOG_CAP`]; decoding and filtering is the caller's job.
+    /// Extension subscriptions use this to replay what arrived before the
+    /// subscriber existed. Every frame here was verified when retained.
+    pub fn retained_frames(&self) -> Vec<Bytes> {
+        self.sync_log.iter().cloned().collect()
     }
 
     /// A page of retained frames for catch-up sync.
@@ -387,11 +428,13 @@ impl DropState {
     /// end adjusts the cursor by exactly the number of dropped frames.
     pub fn sync_frames(&self, cursor: u64, max: usize) -> SyncPage {
         let start = cursor.saturating_sub(self.sync_log_start) as usize;
+        let oldest_cursor = self.sync_log_start;
         if start >= self.sync_log.len() {
             return SyncPage {
                 frames: Vec::new(),
                 end_cursor: self.sync_log_start + self.sync_log.len() as u64,
                 caught_up: true,
+                oldest_cursor,
             };
         }
         let end = (start + max).min(self.sync_log.len());
@@ -400,6 +443,7 @@ impl DropState {
             frames,
             end_cursor: self.sync_log_start + end as u64,
             caught_up: end == self.sync_log.len(),
+            oldest_cursor,
         }
     }
 
@@ -460,10 +504,10 @@ impl DropState {
     }
 
     /// Find an offer by hash, by exact hash-prefix, or by name/alias.
-    pub fn find_offer(&self, hash_or_name: &str) -> Option<BlobHash> {
+    pub fn find_offer(&self, hash_or_name: &str) -> Result<BlobHash, ResolveOfferError> {
         // Exact hash.
         if let Ok(hash) = hash_or_name.parse::<BlobHash>() {
-            return Some(hash);
+            return Ok(hash);
         }
         // Unique hash prefix.
         let prefix_matches: Vec<BlobHash> = self
@@ -472,16 +516,48 @@ impl DropState {
             .filter(|h| h.matches_prefix(hash_or_name))
             .copied()
             .collect();
-        if prefix_matches.len() == 1 {
-            return Some(prefix_matches[0]);
+        match prefix_matches.len() {
+            1 => return Ok(prefix_matches[0]),
+            n if n > 1 => return Err(ResolveOfferError::Ambiguous(prefix_matches)),
+            _ => {}
         }
-        // Name or alias (exact match).
-        self.offers
+        // Name or alias (exact match). A name is a display string, not an
+        // identity: two offers may share one, and picking arbitrarily would
+        // fetch the wrong bytes. Ambiguity is an error with candidates.
+        let name_matches: Vec<BlobHash> = self
+            .offers
             .iter()
-            .find(|(_, r)| r.offer.name == hash_or_name || r.aliases.contains(hash_or_name))
+            .filter(|(_, r)| r.offer.name == hash_or_name || r.aliases.contains(hash_or_name))
             .map(|(h, _)| *h)
+            .collect();
+        match name_matches.len() {
+            0 => Err(ResolveOfferError::NotFound),
+            1 => Ok(name_matches[0]),
+            _ => Err(ResolveOfferError::Ambiguous(name_matches)),
+        }
     }
 }
+
+/// Why a hash/name lookup failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveOfferError {
+    /// Nothing matched.
+    NotFound,
+    /// More than one offer matched; the candidates. Never pick one
+    /// arbitrarily — names are not identities.
+    Ambiguous(Vec<BlobHash>),
+}
+
+impl std::fmt::Display for ResolveOfferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "no offer matches"),
+            Self::Ambiguous(c) => write!(f, "{} offers match; be more specific", c.len()),
+        }
+    }
+}
+
+impl std::error::Error for ResolveOfferError {}
 
 #[cfg(test)]
 mod tests {
@@ -559,13 +635,33 @@ mod tests {
         let hash = BlobHash::from_bytes([0xabu8; 32]);
         state.record_offer(id(1), offer(hash, "slides.pdf"));
         state.record_offer(id(2), offer(hash, "deck.pdf"));
-        assert_eq!(state.find_offer("slides.pdf"), Some(hash));
-        assert_eq!(state.find_offer("deck.pdf"), Some(hash));
-        assert_eq!(state.find_offer(&hash.to_hex()), Some(hash));
-        assert_eq!(state.find_offer("ababab"), Some(hash)); // unique prefix
-        assert_eq!(state.find_offer("cdcdcd"), None); // not a prefix
+        assert_eq!(state.find_offer("slides.pdf").unwrap(), hash);
+        assert_eq!(state.find_offer("deck.pdf").unwrap(), hash);
+        assert_eq!(state.find_offer(&hash.to_hex()).unwrap(), hash);
+        assert_eq!(state.find_offer("ababab").unwrap(), hash); // unique prefix
+        assert!(matches!(
+            state.find_offer("cdcdcd"),
+            Err(ResolveOfferError::NotFound)
+        ));
         let prefix = &hash.to_hex()[..12];
-        assert_eq!(state.find_offer(prefix), Some(hash));
+        assert_eq!(state.find_offer(prefix).unwrap(), hash);
+    }
+
+    #[test]
+    fn ambiguous_name_is_an_error_with_candidates() {
+        let mut state =
+            DropState::new(TopicId::from_bytes([0u8; 32]), id(0), DropPolicy::default());
+        let h1 = BlobHash::from_bytes([0xAA; 32]);
+        let h2 = BlobHash::from_bytes([0xBB; 32]);
+        state.record_offer(id(2), offer(h1, "report.pdf"));
+        state.record_offer(id(3), offer(h2, "report.pdf"));
+        match state.find_offer("report.pdf") {
+            Err(ResolveOfferError::Ambiguous(c)) => {
+                assert_eq!(c.len(), 2);
+                assert!(c.contains(&h1) && c.contains(&h2));
+            }
+            other => panic!("ambiguous names must error, got {other:?}"),
+        }
     }
 
     #[test]

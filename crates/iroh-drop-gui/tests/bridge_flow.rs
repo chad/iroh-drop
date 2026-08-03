@@ -46,10 +46,9 @@ async fn publish_one(
     payload: &std::path::Path,
 ) -> (Arc<Service>, String) {
     let service = Service::new(options(dir, name)).await.expect("service");
-    let client =
-        iroh_drop_daemon::Client::connect_memory(&service, Hello::control("sender"), None)
-            .await
-            .expect("client");
+    let client = iroh_drop_daemon::Client::connect_memory(&service, Hello::control("sender"), None)
+        .await
+        .expect("client");
     let drop = client
         .call("drop.create", json!({"name": name}))
         .await
@@ -126,7 +125,10 @@ fn pasting_a_link_downloads_without_extra_clicks() {
         s.transfers.iter().find(|t| t.finished).cloned()
     });
     assert_eq!(transfer.failed, None, "transfer should have succeeded");
-    assert!(!transfer.saved_to.is_empty(), "we should know where it went");
+    assert!(
+        !transfer.saved_to.is_empty(),
+        "we should know where it went"
+    );
     assert_eq!(
         std::fs::read(&transfer.saved_to[0]).expect("read saved file"),
         b"a picture of a dog\n"
@@ -195,7 +197,9 @@ fn declining_an_unsolicited_offer_writes_nothing() {
 
     let downloads = tmp.path().join("recv2-downloads");
     assert_eq!(
-        std::fs::read_dir(&downloads).expect("read downloads").count(),
+        std::fs::read_dir(&downloads)
+            .expect("read downloads")
+            .count(),
         0,
         "nothing may be written before consent"
     );
@@ -211,7 +215,9 @@ fn declining_an_unsolicited_offer_writes_nothing() {
     // Give a wrongly-started fetch time to betray itself.
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(
-        std::fs::read_dir(&downloads).expect("read downloads").count(),
+        std::fs::read_dir(&downloads)
+            .expect("read downloads")
+            .count(),
         0,
         "declining must write nothing"
     );

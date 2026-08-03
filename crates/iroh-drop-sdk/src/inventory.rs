@@ -161,7 +161,10 @@ pub fn resolve_pick(session: &DropSession, input: &str) -> Result<BlobHash> {
         }
         _ => {}
     }
-    if let Some(hash) = session.resolve(input) {
+    // Protocol-side resolution (aliases included). Ambiguity already
+    // errored above with friendlier wording; anything unresolved falls
+    // through to the prefix matcher.
+    if let Ok(hash) = session.resolve(input) {
         return Ok(hash);
     }
 
