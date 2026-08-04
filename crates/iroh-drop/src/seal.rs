@@ -33,8 +33,8 @@ pub const SEALED_WIRE_VERSION: u16 = 4;
 /// Signature domain for sealed outer frames (see
 /// `crate::message::SEALED_SIGN_DOMAIN`); the signing input includes the
 /// topic — see `crate::message::signing_input`.
-
-/// Body kind carrying a sealed inner envelope.
+///
+/// Body kind carrying a sealed inner envelope:
 pub const KIND_SEALED: u16 = 4;
 
 /// HKDF info string deriving the AEAD key from the drop key and topic.

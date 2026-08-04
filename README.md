@@ -270,6 +270,14 @@ lets you keep serving what you received. `--ephemeral` opts out of both.
 Other flags: `--auto` (fetch every offer automatically, within policy limits),
 `--dir`, `--store`, `--identity`, `-v` (hashes and protocol chatter).
 
+## For agents: the MCP server
+
+An MCP-capable agent (Claude Desktop, etc.) can join, share, and fetch
+through the same daemon — with the consent rule enforced structurally: the
+agent is a control-role client, so unsolicited offers keep waiting for a
+human, and the agent's `fetch` call is the explicit consent for that one
+item. See [`docs/mcp.md`](docs/mcp.md) for setup and the tool list.
+
 ## Using it as a library
 
 Protocol only — hashes in, hashes out:
@@ -308,6 +316,12 @@ for item in inventory(&session) {
 let hash = resolve_pick(&session, "2")?;             // number, name, or prefix
 let files = fetch_any(&session, hash, "./downloads").await?; // tree materialized
 ```
+
+## Why this is a protocol
+
+The design story — what earned bytes on the wire vs. what stayed in the SDK,
+the poisoned-frames lesson, why every frame is signed, and the eight ways
+consent broke before it held: [`docs/why-a-protocol.md`](docs/why-a-protocol.md).
 
 ## Passing it on (the point of all this)
 

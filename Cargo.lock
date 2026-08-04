@@ -2925,6 +2925,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-drop-mcp"
+version = "0.1.0"
+dependencies = [
+ "iroh-drop-daemon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "iroh-drop-presence"
 version = "0.2.0"
 dependencies = [

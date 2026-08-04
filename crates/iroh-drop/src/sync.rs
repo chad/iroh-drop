@@ -258,7 +258,7 @@ impl SyncProtocol {
                     debug!("control: undecodable sync request");
                     return Ok(());
                 };
-                let response = self.sync_page(request, &peer);
+                let response = self.sync_page(request, peer);
                 self.reply(&mut send, OP_SYNC_PAGE, &response).await
             }
             other => {

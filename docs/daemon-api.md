@@ -185,7 +185,16 @@ progress bar and a GUI that hangs.
 | `room.list` / `room.forget` | | |
 
 `peer.label` is the local address book — the "faces and names" that make
-AirDrop legible, kept entirely on your machine, never published. Labels are
+AirDrop legible, kept entirely on your machine, never published.
+
+### Consent semantics for agents (MCP)
+
+Agent clients (`iroh-drop-mcp`, see `docs/mcp.md`) connect with the
+**control** role — never `ui`. Asks route to ui-role clients only, so an
+agent can never absorb a consent question, and an unsolicited offer is never
+auto-accepted just because an agent is connected. The agent's explicit
+`offer.fetch` call *is* the ask-and-answer for that one item. This is
+enforced by `crates/iroh-drop-mcp/tests/agent_fetch.rs`. Labels are
 local nicknames for stable `EndpointId`s (which `identity_path` already
 guarantees across restarts). A peer's *self-asserted* name is untrusted display
 metadata and must be rendered differently from a label you set yourself.

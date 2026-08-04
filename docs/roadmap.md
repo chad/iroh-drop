@@ -69,7 +69,7 @@ protocol** — with a hard boundary between the protocol and the UX built on it.
 | U2 | **One-shot pair**: `iroh-drop share <path>` / `iroh-drop receive <ticket> [pick]` — sendme-grade ergonomics, but N receivers and publisher-independent. Plus numbered picks, auto-listing on join, XDG config, human event log. | ✅ phase 2 |
 | U3 | **Collections** convention: manifest blob + `application/vnd.iroh-drop.collection+json` media type; one offer per tree, member count and total size carried in offer metadata, fetch materializes the tree with path-traversal defence. | ✅ phase 2 |
 | U4 | **Daemon + control API**: long-lived process owns endpoint/sessions; CLI becomes a thin client; JSONL event stream; progress bars; `watch` view; drop address book with auto-rejoin. | ✅ core — `iroh-dropd` + `crates/iroh-drop-daemon`: JSONL over UDS (`0700` dir), tasks, coalesced progress, replayable events, consent asks, and `iroh-drop send/get/watch/drops` as thin clients. Remaining: Windows named pipes, address book, auto-rejoin. See `docs/daemon-api.md` |
-| U5 | **Agent surface**: MCP server crate over the daemon API (`list_drops`, `list_offers`, `publish`, `fetch`, `events`). | planned |
+| U5 | **Agent surface**: MCP server crate over the daemon API (`list_drops`, `list_offers`, `publish`, `fetch`, `events`). | ✅ — `crates/iroh-drop-mcp`: 8 tools over stdio JSON-RPC, control-role only (consent asks never route to agents), zero protocol-crate imports. See `docs/mcp.md` |
 | U6 | **GUI** on the daemon API. | ✅ first cut — `iroh-drop-app` (egui): drag-to-send, link + QR, accept/decline cards, progress, "still sharing". All logic lives in `bridge.rs` and is tested headlessly against real daemons. Remaining: packaging, signing, tray/menu-bar, a TUI if anyone wants one |
 | U7 | **mDNS address lookup** via `iroh-mdns-address-lookup` (0.4) — reach a peer by id on a LAN with no relays and no addresses in the ticket. | ✅ phase 3 — `StackOptions::mdns`, implied by `--offline` |
 | U8 | **QR ticket** in the terminal (`share --qr`) — same room, zero typing, no protocol or security change. | ✅ phase 3 |
@@ -187,7 +187,8 @@ rendezvous mDNS gives us for free — which is why it shipped first.
 - Late joiner sees full inventory **by name** within seconds — no hash
   needed. ✅ (`tests/catch_up_sync.rs`, sub-second on localhost)
 - 1 GiB fetch saturates the link from 2+ providers (after P3).
-- An agent completes "fetch dataset X from drop Y" via MCP with no shell.
+- An agent completes "fetch dataset X from drop Y" via MCP with no shell. ✅
+  (`crates/iroh-drop-mcp/tests/agent_fetch.rs`)
 - Second and later exchanges with the same person need **no string at all**
   (U10), and first-time exchanges in one room need no typing (U8/U11).
 

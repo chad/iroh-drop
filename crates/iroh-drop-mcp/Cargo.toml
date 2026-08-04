@@ -1,0 +1,25 @@
+[package]
+name = "iroh-drop-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "MCP (Model Context Protocol) server for iroh-drop — agent access to a running daemon's control API"
+
+[[bin]]
+name = "iroh-drop-mcp"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Deliberately the ONLY iroh-drop dependency: the daemon client. The MCP
+# server speaks the daemon's control protocol; it never touches the wire
+# crate. That is the boundary rule, enforced by this dependency list.
+iroh-drop-daemon = { path = "../iroh-drop-daemon" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

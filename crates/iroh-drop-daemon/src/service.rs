@@ -359,6 +359,7 @@ impl Service {
             secret_key: None,
             offline: options.offline,
             mdns: options.mdns,
+            relay_url: None,
         })
         .await
         .map_err(ApiError::internal)?

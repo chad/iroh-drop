@@ -144,9 +144,7 @@ impl DropStack {
             RelayMode::Disabled
         } else if let Some(url) = &options.relay_url {
             let url: iroh::RelayUrl = url.parse().map_err(|_| {
-                DropError::Network(NetworkError::Endpoint(format!(
-                    "invalid relay URL: {url}"
-                )))
+                DropError::Network(NetworkError::Endpoint(format!("invalid relay URL: {url}")))
             })?;
             RelayMode::Custom(iroh::RelayMap::from(url))
         } else {
