@@ -30,3 +30,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 iroh-drop-sdk = { path = "crates/iroh-drop-sdk" }
+
+# Web-client wasm builds: the bundle is downloaded on page load and the
+# workload is network-bound, so size beats peak throughput. Used via
+# `wasm-pack build --target web --profile wasm-release`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

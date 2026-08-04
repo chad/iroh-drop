@@ -43,7 +43,15 @@ pub struct WebDrop {
 impl WebDrop {
     /// Start the stack. `identity` is the 32-byte secret key returned by
     /// [`WebDrop::identity`] on a previous run, or `null` for a fresh one.
-    pub async fn start(identity: Option<Vec<u8>>) -> Result<WebDrop, JsError> {
+    ///
+    /// `relay_url` selects a relay server (e.g. a self-hosted
+    /// `https://relay.example.com`); `null`/`undefined` uses iroh's
+    /// defaults (n0's public relays, which rate-limit large transfers —
+    /// self-host for anything heavy).
+    pub async fn start(
+        identity: Option<Vec<u8>>,
+        relay_url: Option<String>,
+    ) -> Result<WebDrop, JsError> {
         console_error_panic_hook::set_once();
         let secret_key = match identity {
             Some(bytes) => {
@@ -56,6 +64,7 @@ impl WebDrop {
         };
         let options = StackOptions {
             secret_key,
+            relay_url,
             ..Default::default()
         };
         let protocol = DropBuilder::from_options(options)
@@ -91,7 +100,7 @@ impl WebDrop {
         Ok(WebSession { session })
     }
 
-    /// Join an existing drop from a ticket string (`drop1…`).
+    /// Join an existing drop from a ticket string (`drop2…`).
     pub async fn join(&self, ticket: &str) -> Result<WebSession, JsError> {
         let ticket = DropTicket::from_string_prefixed(ticket).map_err(js_err)?;
         let session = self.protocol.join(ticket).await.map_err(js_err)?;

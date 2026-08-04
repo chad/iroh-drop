@@ -60,6 +60,11 @@ pub struct StackOptions {
     /// themselves (a browser persisting to localStorage, a mobile app using
     /// a keychain). Takes precedence over [`Self::identity_path`].
     pub secret_key: Option<SecretKey>,
+    /// Relay server URL for hole-punching and relayed fallback.
+    /// `None` uses iroh's defaults (n0's public relays, which rate-limit
+    /// large transfers). Point at a self-hosted relay for heavy use.
+    /// Ignored in [`Self::offline`] mode, where relays are disabled.
+    pub relay_url: Option<String>,
     /// Announce and resolve endpoint addresses on the local network with
     /// mDNS. This makes peers reachable by id alone on a LAN — including in
     /// [`Self::offline`] mode, where there is no relay or DNS lookup — and
@@ -133,25 +138,30 @@ impl DropStack {
             None
         };
 
-        #[cfg(feature = "mdns")]
+        // A custom relay replaces the preset's default; offline always
+        // wins (no relays at all).
+        let relay_mode = if options.offline {
+            RelayMode::Disabled
+        } else if let Some(url) = &options.relay_url {
+            let url: iroh::RelayUrl = url.parse().map_err(|_| {
+                DropError::Network(NetworkError::Endpoint(format!(
+                    "invalid relay URL: {url}"
+                )))
+            })?;
+            RelayMode::Custom(iroh::RelayMap::from(url))
+        } else {
+            RelayMode::Default
+        };
+        // `mut` is only exercised when the mdns feature adds a lookup below.
+        #[allow(unused_mut)]
         let mut builder = if options.offline {
             Endpoint::builder(presets::Minimal)
-                .relay_mode(RelayMode::Disabled)
+                .relay_mode(relay_mode)
                 .address_lookup(lookup.clone())
                 .secret_key(secret)
         } else {
             Endpoint::builder(presets::N0)
-                .address_lookup(lookup.clone())
-                .secret_key(secret)
-        };
-        #[cfg(not(feature = "mdns"))]
-        let builder = if options.offline {
-            Endpoint::builder(presets::Minimal)
-                .relay_mode(RelayMode::Disabled)
-                .address_lookup(lookup.clone())
-                .secret_key(secret)
-        } else {
-            Endpoint::builder(presets::N0)
+                .relay_mode(relay_mode)
                 .address_lookup(lookup.clone())
                 .secret_key(secret)
         };
@@ -159,6 +169,13 @@ impl DropStack {
         if let Some(mdns) = &mdns {
             builder = builder.address_lookup(mdns.clone());
         }
+        #[cfg(not(feature = "mdns"))]
+        let builder = {
+            let mut b = builder;
+            // silence unused-mut when mdns is off
+            let _ = &mut b;
+            b
+        };
         let endpoint = builder
             .bind()
             .await

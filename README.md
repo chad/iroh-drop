@@ -194,6 +194,12 @@ iroh-drop share ./report.pdf --lan         # they run: iroh-drop nearby
 iroh-drop share ./report.pdf --room team   # you both use --room team forever
 ```
 
+Or skip the install on their end entirely: run the daemon with
+`--link-base https://iroh-drop.boxd.sh` and every share result also carries
+a `web_link` — a URL any browser can open to receive with the zero-install
+web client (the ticket rides in the URL fragment, so the web host never
+sees it).
+
 **QR** is just the ticket, rendered. **Rooms** are saved tickets under a name:
 `share --room team` remembers the drop, `receive --room team` rejoins it, and
 `iroh-drop rooms` lists what you have. Each join refreshes the room with a

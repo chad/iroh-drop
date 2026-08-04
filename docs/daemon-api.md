@@ -195,6 +195,18 @@ metadata and must be rendered differently from a label you set yourself.
 `daemon.status`, `daemon.config.get/set`, `daemon.shutdown`,
 `events.replay {from}`.
 
+### Web links (`--link-base`)
+
+`iroh-dropd --link-base https://iroh-drop.boxd.sh` makes every share result
+include a `web_link` field next to `link` and `ticket`: a URL of the form
+`<base>#<ticket>` that opens the zero-install web client straight into the
+receive flow. The ticket rides in the URL **fragment**, so the static web
+host never sees it — the link is the same bearer capability as the ticket,
+just browser-openable. Omit the flag and the field is absent. Point it at
+your own deployment of `crates/iroh-drop-web` if you self-host; the public
+instance's hosting story (currently a VM, intended to become static CI
+deploys) changes nothing on the wire.
+
 ## Events
 
 `seq` is a monotonic counter. Clients persist the last `seq` they saw and call

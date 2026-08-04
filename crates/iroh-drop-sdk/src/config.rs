@@ -36,6 +36,10 @@ pub struct Config {
     pub max_auto_blob_size: u64,
     /// Total automatic download budget per session, in bytes.
     pub max_auto_total_bytes: u64,
+    /// Base URL for web links in share responses. Set to a web-client host
+    /// (e.g. `https://iroh-drop.boxd.sh`) and share results include a
+    /// `web_link` a browser can open directly. `None` omits the field.
+    pub link_base: Option<String>,
 }
 
 impl Default for Config {
@@ -48,6 +52,7 @@ impl Default for Config {
             auto_fetch: false,
             max_auto_blob_size: DropPolicy::default().max_blob_size,
             max_auto_total_bytes: DropPolicy::default().max_total_auto_fetch_bytes,
+            link_base: None,
         }
     }
 }
@@ -95,6 +100,9 @@ impl Config {
             offline,
             identity_path: Some(self.identity_path.clone()),
             secret_key: None,
+            // Desktop defaults ride the public n0 relays; a custom relay is
+            // a StackOptions-level knob, not (yet) a config key.
+            relay_url: None,
             mdns,
         }
     }
@@ -106,6 +114,7 @@ impl Config {
             offline,
             identity_path: None,
             secret_key: None,
+            relay_url: None,
             mdns,
         }
     }

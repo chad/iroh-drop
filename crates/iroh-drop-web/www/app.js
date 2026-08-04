@@ -14,6 +14,10 @@ const fmtSize = (n) =>
   n > 1e6 ? (n / 1e6).toFixed(1) + ' MB' :
   n > 1e3 ? (n / 1e3).toFixed(1) + ' KB' : n + ' B';
 
+// Relay: null = n0's public relays (rate-limited for big transfers).
+// Self-hosting? Set e.g. 'https://relay.example.com' and redeploy.
+const RELAY_URL = null;
+
 // Identity: 32 bytes in localStorage, so peers recognize us across reloads.
 const b64 = (u8) => btoa(String.fromCharCode(...u8));
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
@@ -192,7 +196,7 @@ async function main() {
 
   await init();
   const stored = localStorage.getItem('iroh-drop:identity');
-  const drop = await WebDrop.start(stored ? unb64(stored) : null);
+  const drop = await WebDrop.start(stored ? unb64(stored) : null, RELAY_URL);
   localStorage.setItem('iroh-drop:identity', b64(drop.identity()));
   const ep = `endpoint ${drop.endpoint_id().slice(0, 10)}…`;
   $('status-text').dataset.ep = ep;
